@@ -8,6 +8,7 @@ import psycopg2
 from datetime import datetime, timedelta
 import threading
 import time
+import requests as http_requests
 
 app = Flask(__name__)
 
@@ -134,13 +135,34 @@ def send_reply(api_client, reply_token, reply):
         ReplyMessageRequest(reply_token=reply_token, messages=[reply])
     )
 
+import requests as http_requests
+
 def push_group(text):
     if GROUP_ID:
-        with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).push_message(PushMessageRequest(
-                to=GROUP_ID,
-                messages=[TextMessage(text=text)]
-            ))
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")}'
+        }
+        data = {
+            'to': GROUP_ID,
+            'messages': [{
+                'type': 'textV2',
+                'text': '{mention} \n{text}'.format(mention='{mention}', text=text),
+                'substitution': {
+                    'mention': {
+                        'type': 'mention',
+                        'mentionee': {
+                            'type': 'all'
+                        }
+                    }
+                }
+            }]
+        }
+        http_requests.post(
+            'https://api.line.me/v2/bot/message/push',
+            headers=headers,
+            json=data
+        )
 
 def process_action(action, value, context, user_id, api_client, reply_token):
     if action == 'ごはん':
