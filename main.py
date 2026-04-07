@@ -47,6 +47,12 @@ def init_db():
             notify_time TIME
         )
     ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS depart_check_schedule (
+            id SERIAL PRIMARY KEY,
+            notify_time TIME
+        )
+    ''')
     conn.commit()
     cur.close()
     conn.close()
@@ -83,6 +89,14 @@ def reminder_loop():
                 diff = abs((now - notify_dt).total_seconds())
                 if diff < 60 and GROUP_ID:
                     push_group('🛁 お風呂洗ってありますか？')
+            
+            cur.execute('SELECT notify_time FROM depart_check_schedule LIMIT 1')
+            row = cur.fetchone()
+            if row:
+                notify_dt = datetime.combine(now.date(), row[0])
+                diff = abs((now - notify_dt).total_seconds())
+                if diff < 60 and GROUP_ID:
+                    push_group('🚃 今日の帰宅・出発時間を教えてください！\nまめBotの個別チャットで「出発・帰宅」から共有してください。')
 
             cur.close()
             conn.close()
@@ -368,8 +382,44 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         reply = TextMessage(text='家族グループに送りました☑️')
 
     elif action == '帰宅確認':
+        reply = TextMessage(text='どうしますか？', quick_reply=QuickReply(items=[
+            QuickReplyItem(action=PostbackAction(label='📤 今すぐ送信', data='action=帰宅確認今すぐ')),
+            QuickReplyItem(action=PostbackAction(label='⏰ 毎日自動送信を設定', data='action=帰宅確認時間設定')),
+        ]))
+
+    elif action == '帰宅確認今すぐ':
         push_group('🚃 今日の帰宅・出発時間を教えてください！\nまめBotの個別チャットで「出発・帰宅」から共有してください。')
         reply = TextMessage(text='家族グループに確認メッセージを送りました☑️')
+
+    elif action == '帰宅確認時間設定':
+        user_state[user_id] = {'action': 'set_depart_check_ampm'}
+        reply = TextMessage(text='何時に自動送信しますか？', quick_reply=QuickReply(items=[
+            QuickReplyItem(action=PostbackAction(label='午前', data='action=帰宅確認時間帯&value=am')),
+            QuickReplyItem(action=PostbackAction(label='午後', data='action=帰宅確認時間帯&value=pm')),
+        ]))
+
+    elif action == '帰宅確認時間帯':
+        hours = AM_HOURS if value == 'am' else PM_HOURS
+        user_state[user_id]['action'] = 'set_depart_check_hour'
+        reply = TextMessage(text='何時ですか？', quick_reply=make_hour_qr(hours, 'depart_check'))
+
+    elif action == '時' and context == 'depart_check':
+        user_state[user_id]['hour'] = int(value)
+        user_state[user_id]['action'] = 'set_depart_check_minute'
+        reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('depart_check'))
+
+    elif action == '分' and context == 'depart_check':
+        hour = user_state[user_id].get('hour')
+        minute = int(value)
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('DELETE FROM depart_check_schedule')
+        cur.execute('INSERT INTO depart_check_schedule (notify_time) VALUES (%s)', (f'{hour:02d}:{minute:02d}',))
+        conn.commit()
+        cur.close()
+        conn.close()
+        user_state.pop(user_id, None)
+        reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}に帰宅確認を送ります！')
 
     # ========== ゴミの日 ==========
     elif action == 'ゴミの日':
