@@ -40,6 +40,12 @@ def init_db():
             notify_time TIME DEFAULT '07:00'
         )
     ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS bath_schedule (
+            id SERIAL PRIMARY KEY,
+            notify_time TIME
+        )
+    ''')
     conn.commit()
     cur.close()
     conn.close()
@@ -62,7 +68,7 @@ def reminder_loop():
                     with ApiClient(configuration) as api_client:
                         MessagingApi(api_client).push_message(PushMessageRequest(
                             to=group_id,
-                            messages=[TextMessage(text=f'🍚 {meal_type}ごはんの時間まであと{remind_minutes}分です！')]
+                            messages=[TextMessage(text=f'🍚 {meal_type}ごはんリマインド\n⏰ {meal_time.strftime("%H:%M")} まであと{remind_minutes}分')]
                         ))
 
             cur.execute('SELECT trash_type, weekdays, notify_time FROM trash_schedule')
@@ -76,6 +82,19 @@ def reminder_loop():
                                 to=GROUP_ID,
                                 messages=[TextMessage(text=f'🗑️ 今日は{trash_type}の日です！忘れずに！')]
                             ))
+
+            cur.execute('SELECT notify_time FROM bath_schedule LIMIT 1')
+            row = cur.fetchone()
+            if row:
+                notify_dt = datetime.combine(now.date(), row[0])
+                diff = abs((now - notify_dt).total_seconds())
+                if diff < 60 and GROUP_ID:
+                    with ApiClient(configuration) as api_client:
+                        MessagingApi(api_client).push_message(PushMessageRequest(
+                            to=GROUP_ID,
+                            messages=[TextMessage(text='🛁 お風呂洗ってありますか？')]
+                        ))
+
             cur.close()
             conn.close()
         except Exception as e:
@@ -134,7 +153,6 @@ def handle_postback(event):
 
     with ApiClient(configuration) as api_client:
 
-        # リッチメニューのメインアクション
         if action == 'ごはん':
             user_state.pop(user_id, None)
             reply = TextMessage(text='どの時間帯を設定しますか？', quick_reply=QuickReply(items=[
@@ -192,13 +210,41 @@ def handle_postback(event):
                 QuickReplyItem(action=PostbackAction(label='✅ 洗った', data='action=お風呂状況&value=洗いました🚿')),
                 QuickReplyItem(action=PostbackAction(label='❌ 洗ってない', data='action=お風呂状況&value=まだ洗っていません💦')),
                 QuickReplyItem(action=PostbackAction(label='🛁 洗って入れた', data='action=お風呂状況&value=洗ってお湯を入れました🛁')),
+                QuickReplyItem(action=PostbackAction(label='📢 お願いする', data='action=お風呂お願い')),
+                QuickReplyItem(action=PostbackAction(label='⏰ リマインド時間を設定', data='action=お風呂時間設定')),
             ]))
 
         elif action == 'お風呂状況':
             name = user_state.get(user_id, {}).get('name', 'だれか')
             push_group(f'🛁 {name}がお風呂を{value}')
             user_state.pop(user_id, None)
-            reply = TextMessage(text='家族グループに送りました！')
+            reply = TextMessage(text='家族グループに送りました☑️')
+
+        elif action == 'お風呂お願い':
+            push_group('🛁 お風呂を洗ってください！')
+            reply = TextMessage(text='家族グループにお願いしました☑️')
+
+        elif action == 'お風呂時間設定':
+            user_state[user_id] = {'action': 'set_bath_hour'}
+            reply = TextMessage(text='何時台に確認しますか？', quick_reply=make_hour_qr([19,20,21,22,23], 'bath'))
+
+        elif action == '時' and context == 'bath':
+            user_state[user_id]['hour'] = int(value)
+            user_state[user_id]['action'] = 'set_bath_minute'
+            reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('bath'))
+
+        elif action == '分' and context == 'bath':
+            hour = user_state[user_id].get('hour')
+            minute = int(value)
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute('DELETE FROM bath_schedule')
+            cur.execute('INSERT INTO bath_schedule (notify_time) VALUES (%s)', (f'{hour:02d}:{minute:02d}',))
+            conn.commit()
+            cur.close()
+            conn.close()
+            user_state.pop(user_id, None)
+            reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}にお風呂の確認を送ります！')
 
         elif action == '出発・帰宅':
             user_state.pop(user_id, None)
@@ -242,11 +288,11 @@ def handle_postback(event):
                 name = 'だれか'
             push_group(f'🚃 {name} {time_str}{kind}予定 / {value}')
             user_state.pop(user_id, None)
-            reply = TextMessage(text='家族グループに送りました！')
+            reply = TextMessage(text='家族グループに送りました☑️')
 
         elif action == '帰宅確認':
             push_group('🚃 今日の帰宅・出発時間を教えてください！\nまめBotの個別チャットで「出発・帰宅」から共有してください。')
-            reply = TextMessage(text='家族グループに確認メッセージを送りました！')
+            reply = TextMessage(text='家族グループに確認メッセージを送りました☑️')
 
         elif action == 'ゴミの日':
             user_state.pop(user_id, None)
@@ -340,8 +386,6 @@ def handle_postback(event):
             reply = TextMessage(text='メニューから選んでください。')
 
         send_reply(api_client, event.reply_token, reply)
-
-from linebot.v3.webhooks import JoinEvent, FollowEvent
 
 @handler.add(FollowEvent)
 def handle_follow(event):
