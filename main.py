@@ -5,7 +5,7 @@ from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent, JoinEvent, FollowEvent
 import os
 import psycopg2
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import threading
 import time
 import requests as http_requests
@@ -92,7 +92,9 @@ def reminder_loop():
         try:
             conn = get_db()
             cur = conn.cursor()
-            now = datetime.now()
+            from datetime import timezone, timedelta as td
+            JST = timezone(td(hours=9))
+            now = datetime.now(JST).replace(tzinfo=None)
             weekday_map = {0:'月',1:'火',2:'水',3:'木',4:'金',5:'土',6:'日'}
             today = weekday_map[now.weekday()]
 
