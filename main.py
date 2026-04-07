@@ -501,6 +501,7 @@ def setup_rich_menu():
 
 with app.app_context():
     init_db()
+    setup_rich_menu()  # ←追加
     t = threading.Thread(target=reminder_loop, daemon=True)
     t.start()
 
