@@ -8,7 +8,6 @@ import psycopg2
 from datetime import datetime, timedelta
 import threading
 import time
-import re
 
 app = Flask(__name__)
 
@@ -51,9 +50,8 @@ def reminder_loop():
             conn = get_db()
             cur = conn.cursor()
             now = datetime.now()
-            weekday = now.weekday()
             weekday_map = {0:'月',1:'火',2:'水',3:'木',4:'金',5:'土',6:'日'}
-            today = weekday_map[weekday]
+            today = weekday_map[now.weekday()]
 
             cur.execute('SELECT meal_type, meal_time, remind_minutes, group_id FROM meal_times')
             for meal_type, meal_time, remind_minutes, group_id in cur.fetchall():
@@ -86,30 +84,21 @@ def reminder_loop():
 
 user_state = {}
 
-MINUTES_QR = QuickReply(items=[
-    QuickReplyItem(action=MessageAction(label='00分', text='分_00')),
-    QuickReplyItem(action=MessageAction(label='05分', text='分_05')),
-    QuickReplyItem(action=MessageAction(label='10分', text='分_10')),
-    QuickReplyItem(action=MessageAction(label='15分', text='分_15')),
-    QuickReplyItem(action=MessageAction(label='20分', text='分_20')),
-    QuickReplyItem(action=MessageAction(label='25分', text='分_25')),
-    QuickReplyItem(action=MessageAction(label='30分', text='分_30')),
-    QuickReplyItem(action=MessageAction(label='35分', text='分_35')),
-    QuickReplyItem(action=MessageAction(label='40分', text='分_40')),
-    QuickReplyItem(action=MessageAction(label='45分', text='分_45')),
-    QuickReplyItem(action=MessageAction(label='50分', text='分_50')),
-    QuickReplyItem(action=MessageAction(label='55分', text='分_55')),
-])
-
-def make_hour_qr(hours):
+def make_hour_qr(hours, context):
     return QuickReply(items=[
-        QuickReplyItem(action=MessageAction(label=f'{h}時', text=f'時_{h}'))
+        QuickReplyItem(action=PostbackAction(label=f'{h}時', data=f'action=時&value={h}&context={context}'))
         for h in hours
     ])
 
-MORNING_HOURS = make_hour_qr([6,7,8,9,10])
-LUNCH_HOURS = make_hour_qr([11,12,13,14])
-EVENING_HOURS = make_hour_qr([17,18,19,20,21,22])
+def make_minute_qr(context):
+    return QuickReply(items=[
+        QuickReplyItem(action=PostbackAction(label=f'{m:02d}分', data=f'action=分&value={m}&context={context}'))
+        for m in [0,5,10,15,20,25,30,35,40,45,50,55]
+    ])
+
+MORNING_HOURS = [6,7,8,9,10]
+LUNCH_HOURS = [11,12,13,14]
+EVENING_HOURS = [17,18,19,20,21,22]
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -121,58 +110,54 @@ def callback():
         abort(400)
     return 'OK'
 
+def send_reply(api_client, reply_token, reply):
+    MessagingApi(api_client).reply_message(
+        ReplyMessageRequest(reply_token=reply_token, messages=[reply])
+    )
+
+def push_group(text):
+    if GROUP_ID:
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message(PushMessageRequest(
+                to=GROUP_ID,
+                messages=[TextMessage(text=text)]
+            ))
+
 @handler.add(PostbackEvent)
 def handle_postback(event):
     data = event.postback.data
     params = dict(item.split('=') for item in data.split('&'))
     action = params.get('action', '')
-    fake_event = type('obj', (object,), {
-        'message': type('obj', (object,), {'text': action})(),
-        'source': event.source,
-        'reply_token': event.reply_token
-    })()
-    handle_message(fake_event)
-
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
-    text = event.message.text
+    value = params.get('value', '')
+    context = params.get('context', '')
     user_id = event.source.user_id
 
     with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
 
-        # ========== ごはん ==========
-        if text == 'ごはん':
+        # リッチメニューのメインアクション
+        if action == 'ごはん':
             user_state.pop(user_id, None)
-            quick_reply = QuickReply(items=[
-                QuickReplyItem(action=MessageAction(label='🌅 朝', text='ごはん_朝')),
-                QuickReplyItem(action=MessageAction(label='☀️ 昼', text='ごはん_昼')),
-                QuickReplyItem(action=MessageAction(label='🌙 夜', text='ごはん_夜')),
-                QuickReplyItem(action=MessageAction(label='🔔 できました！', text='ごはんできた')),
-            ])
-            reply = TextMessage(text='どの時間帯を設定しますか？', quick_reply=quick_reply)
+            reply = TextMessage(text='どの時間帯を設定しますか？', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='🌅 朝', data='action=ごはん選択&value=朝')),
+                QuickReplyItem(action=PostbackAction(label='☀️ 昼', data='action=ごはん選択&value=昼')),
+                QuickReplyItem(action=PostbackAction(label='🌙 夜', data='action=ごはん選択&value=夜')),
+                QuickReplyItem(action=PostbackAction(label='🔔 できました！', data='action=ごはんできた')),
+            ]))
 
-        elif text == 'ごはん_朝':
-            user_state[user_id] = {'action': 'set_meal_hour', 'meal_type': '朝'}
-            reply = TextMessage(text='朝ごはんは何時台ですか？', quick_reply=MORNING_HOURS)
+        elif action == 'ごはん選択':
+            meal_type = value
+            user_state[user_id] = {'action': 'set_meal_hour', 'meal_type': meal_type}
+            hours = MORNING_HOURS if meal_type == '朝' else LUNCH_HOURS if meal_type == '昼' else EVENING_HOURS
+            reply = TextMessage(text=f'{meal_type}ごはんは何時台ですか？', quick_reply=make_hour_qr(hours, 'meal'))
 
-        elif text == 'ごはん_昼':
-            user_state[user_id] = {'action': 'set_meal_hour', 'meal_type': '昼'}
-            reply = TextMessage(text='昼ごはんは何時台ですか？', quick_reply=LUNCH_HOURS)
-
-        elif text == 'ごはん_夜':
-            user_state[user_id] = {'action': 'set_meal_hour', 'meal_type': '夜'}
-            reply = TextMessage(text='夜ごはんは何時台ですか？', quick_reply=EVENING_HOURS)
-
-        elif text.startswith('時_') and user_id in user_state and user_state[user_id].get('action') == 'set_meal_hour':
-            hour = int(text.replace('時_', ''))
-            user_state[user_id]['hour'] = hour
+        elif action == '時' and context == 'meal':
+            user_state[user_id]['hour'] = int(value)
             user_state[user_id]['action'] = 'set_meal_minute'
-            reply = TextMessage(text=f'{hour}時何分ですか？', quick_reply=MINUTES_QR)
+            reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('meal'))
 
-        elif text.startswith('分_') and user_id in user_state and user_state[user_id].get('action') == 'set_meal_minute':
-            minute = int(text.replace('分_', ''))
+        elif action == '分' and context == 'meal':
             hour = user_state[user_id]['hour']
+            minute = int(value)
             meal_type = user_state[user_id]['meal_type']
             conn = get_db()
             cur = conn.cursor()
@@ -185,135 +170,85 @@ def handle_message(event):
             cur.close()
             conn.close()
             user_state.pop(user_id, None)
-            quick_reply = QuickReply(items=[
-                QuickReplyItem(action=MessageAction(label='🌅 朝も設定', text='ごはん_朝')),
-                QuickReplyItem(action=MessageAction(label='☀️ 昼も設定', text='ごはん_昼')),
-                QuickReplyItem(action=MessageAction(label='🌙 夜も設定', text='ごはん_夜')),
-                QuickReplyItem(action=MessageAction(label='✅ 終わり', text='ごはん設定完了')),
-            ])
-            reply = TextMessage(
-                text=f'✅ {meal_type}ごはん {hour:02d}:{minute:02d} を登録しました！\n2時間前にリマインドします。\n他の時間帯も設定しますか？',
-                quick_reply=quick_reply
-            )
+            reply = TextMessage(text=f'✅ {meal_type}ごはん {hour:02d}:{minute:02d} を登録しました！\n2時間前にリマインドします。', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='🌅 朝も設定', data='action=ごはん選択&value=朝')),
+                QuickReplyItem(action=PostbackAction(label='☀️ 昼も設定', data='action=ごはん選択&value=昼')),
+                QuickReplyItem(action=PostbackAction(label='🌙 夜も設定', data='action=ごはん選択&value=夜')),
+                QuickReplyItem(action=PostbackAction(label='✅ 終わり', data='action=完了')),
+            ]))
 
-        elif text == 'ごはん設定完了':
-            reply = TextMessage(text='ごはんの設定が完了しました！🍚')
-
-        elif text == 'ごはんできた':
-            if GROUP_ID:
-                with ApiClient(configuration) as api_client2:
-                    MessagingApi(api_client2).push_message(PushMessageRequest(
-                        to=GROUP_ID,
-                        messages=[TextMessage(text='🍚 ご飯ができました！みんな集まってください！')]
-                    ))
+        elif action == 'ごはんできた':
+            push_group('🍚 ご飯ができました！みんな集まってください！')
             reply = TextMessage(text='家族グループに送りました！')
 
-        # ========== お風呂 ==========
-        elif text == 'お風呂':
+        elif action == 'お風呂':
             user_state.pop(user_id, None)
             try:
-                profile = line_bot_api.get_profile(user_id)
-                name = profile.display_name
+                name = MessagingApi(api_client).get_profile(user_id).display_name
             except:
                 name = 'あなた'
             user_state[user_id] = {'name': name}
-            quick_reply = QuickReply(items=[
-                QuickReplyItem(action=MessageAction(label='✅ 洗った', text='お風呂_洗った')),
-                QuickReplyItem(action=MessageAction(label='❌ 洗ってない', text='お風呂_洗ってない')),
-                QuickReplyItem(action=MessageAction(label='🛁 洗って入れた', text='お風呂_洗って入れた')),
-            ])
-            reply = TextMessage(text='お風呂の状況を教えてください！', quick_reply=quick_reply)
+            reply = TextMessage(text='お風呂の状況を教えてください！', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='✅ 洗った', data='action=お風呂状況&value=洗いました🚿')),
+                QuickReplyItem(action=PostbackAction(label='❌ 洗ってない', data='action=お風呂状況&value=まだ洗っていません💦')),
+                QuickReplyItem(action=PostbackAction(label='🛁 洗って入れた', data='action=お風呂状況&value=洗ってお湯を入れました🛁')),
+            ]))
 
-        elif text in ['お風呂_洗った', 'お風呂_洗ってない', 'お風呂_洗って入れた']:
-            status_map = {
-                'お風呂_洗った': '洗いました🚿',
-                'お風呂_洗ってない': 'まだ洗っていません💦',
-                'お風呂_洗って入れた': '洗ってお湯を入れました🛁'
-            }
-            status = status_map[text]
+        elif action == 'お風呂状況':
             name = user_state.get(user_id, {}).get('name', 'だれか')
-            if GROUP_ID:
-                with ApiClient(configuration) as api_client2:
-                    MessagingApi(api_client2).push_message(PushMessageRequest(
-                        to=GROUP_ID,
-                        messages=[TextMessage(text=f'🛁 {name}がお風呂を{status}')]
-                    ))
+            push_group(f'🛁 {name}がお風呂を{value}')
             user_state.pop(user_id, None)
             reply = TextMessage(text='家族グループに送りました！')
 
-        # ========== 出発・帰宅 ==========
-        elif text == '出発・帰宅':
+        elif action == '出発・帰宅':
             user_state.pop(user_id, None)
-            quick_reply = QuickReply(items=[
-                QuickReplyItem(action=MessageAction(label='📤 共有する', text='帰宅_共有')),
-                QuickReplyItem(action=MessageAction(label='📥 確認する', text='帰宅_確認')),
-            ])
-            reply = TextMessage(text='共有しますか？確認しますか？', quick_reply=quick_reply)
+            reply = TextMessage(text='共有しますか？確認しますか？', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='📤 共有する', data='action=帰宅共有メニュー')),
+                QuickReplyItem(action=PostbackAction(label='📥 確認する', data='action=帰宅確認')),
+            ]))
 
-        elif text == '帰宅_共有':
-            quick_reply = QuickReply(items=[
-                QuickReplyItem(action=MessageAction(label='🏠 帰宅', text='帰宅_共有_帰宅')),
-                QuickReplyItem(action=MessageAction(label='🚃 出発', text='帰宅_共有_出発')),
-            ])
-            reply = TextMessage(text='帰宅・出発どちらを共有しますか？', quick_reply=quick_reply)
+        elif action == '帰宅共有メニュー':
+            reply = TextMessage(text='帰宅・出発どちらを共有しますか？', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='🏠 帰宅', data='action=帰宅種類&value=帰宅')),
+                QuickReplyItem(action=PostbackAction(label='🚃 出発', data='action=帰宅種類&value=出発')),
+            ]))
 
-        elif text in ['帰宅_共有_帰宅', '帰宅_共有_出発']:
-            kind = '帰宅' if text == '帰宅_共有_帰宅' else '出発'
-            user_state[user_id] = {'action': 'share_time_hour', 'kind': kind}
-            reply = TextMessage(text=f'{kind}は何時台ですか？', quick_reply=EVENING_HOURS)
+        elif action == '帰宅種類':
+            user_state[user_id] = {'action': 'share_time_hour', 'kind': value}
+            reply = TextMessage(text=f'{value}は何時台ですか？', quick_reply=make_hour_qr(EVENING_HOURS, 'share'))
 
-        elif text.startswith('時_') and user_id in user_state and user_state[user_id].get('action') == 'share_time_hour':
-            hour = int(text.replace('時_', ''))
-            user_state[user_id]['hour'] = hour
+        elif action == '時' and context == 'share':
+            user_state[user_id]['hour'] = int(value)
             user_state[user_id]['action'] = 'share_time_minute'
-            reply = TextMessage(text=f'{hour}時何分ですか？', quick_reply=MINUTES_QR)
+            reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('share'))
 
-        elif text.startswith('分_') and user_id in user_state and user_state[user_id].get('action') == 'share_time_minute':
-            minute = int(text.replace('分_', ''))
+        elif action == '分' and context == 'share':
             hour = user_state[user_id]['hour']
+            minute = int(value)
             user_state[user_id]['time'] = f'{hour:02d}:{minute:02d}'
             user_state[user_id]['action'] = 'share_meal'
-            quick_reply = QuickReply(items=[
-                QuickReplyItem(action=MessageAction(label='🏠 家で食べる', text='ごはん状況_家')),
-                QuickReplyItem(action=MessageAction(label='🍴 外で食べる', text='ごはん状況_外')),
-                QuickReplyItem(action=MessageAction(label='❓ 未定', text='ごはん状況_未定')),
-            ])
-            reply = TextMessage(text='ご飯はどうしますか？', quick_reply=quick_reply)
+            reply = TextMessage(text='ご飯はどうしますか？', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='🏠 家で食べる', data='action=ごはん状況&value=家で食べる🏠')),
+                QuickReplyItem(action=PostbackAction(label='🍴 外で食べる', data='action=ごはん状況&value=外で食べる🍴')),
+                QuickReplyItem(action=PostbackAction(label='❓ 未定', data='action=ごはん状況&value=未定❓')),
+            ]))
 
-        elif text in ['ごはん状況_家', 'ごはん状況_外', 'ごはん状況_未定'] and user_id in user_state and user_state[user_id].get('action') == 'share_meal':
-            meal_map = {
-                'ごはん状況_家': '家で食べる🏠',
-                'ごはん状況_外': '外で食べる🍴',
-                'ごはん状況_未定': '未定❓'
-            }
-            meal_status = meal_map[text]
+        elif action == 'ごはん状況':
             kind = user_state[user_id]['kind']
             time_str = user_state[user_id]['time']
             try:
-                profile = line_bot_api.get_profile(user_id)
-                name = profile.display_name
+                name = MessagingApi(api_client).get_profile(user_id).display_name
             except:
                 name = 'だれか'
-            if GROUP_ID:
-                with ApiClient(configuration) as api_client2:
-                    MessagingApi(api_client2).push_message(PushMessageRequest(
-                        to=GROUP_ID,
-                        messages=[TextMessage(text=f'🚃 {name} {time_str}{kind}予定 / {meal_status}')]
-                    ))
+            push_group(f'🚃 {name} {time_str}{kind}予定 / {value}')
             user_state.pop(user_id, None)
             reply = TextMessage(text='家族グループに送りました！')
 
-        elif text == '帰宅_確認':
-            if GROUP_ID:
-                with ApiClient(configuration) as api_client2:
-                    MessagingApi(api_client2).push_message(PushMessageRequest(
-                        to=GROUP_ID,
-                        messages=[TextMessage(text='🚃 今日の帰宅・出発時間を教えてください！\nまめBotの個別チャットで「出発・帰宅」から共有してください。')]
-                    ))
+        elif action == '帰宅確認':
+            push_group('🚃 今日の帰宅・出発時間を教えてください！\nまめBotの個別チャットで「出発・帰宅」から共有してください。')
             reply = TextMessage(text='家族グループに確認メッセージを送りました！')
 
-        # ========== ゴミの日 ==========
-        elif text == 'ゴミの日':
+        elif action == 'ゴミの日':
             user_state.pop(user_id, None)
             conn = get_db()
             cur = conn.cursor()
@@ -323,87 +258,64 @@ def handle_message(event):
             conn.close()
             if rows:
                 schedule_text = '\n'.join([f'・{t}: {w}曜日' for t, w in rows])
-                quick_reply = QuickReply(items=[
-                    QuickReplyItem(action=MessageAction(label='➕ 追加・変更', text='ゴミ登録')),
-                ])
-                reply = TextMessage(
-                    text=f'現在のゴミ出しスケジュール📅\n{schedule_text}',
-                    quick_reply=quick_reply
-                )
+                reply = TextMessage(text=f'現在のゴミ出しスケジュール📅\n{schedule_text}', quick_reply=QuickReply(items=[
+                    QuickReplyItem(action=PostbackAction(label='➕ 追加・変更', data='action=ゴミ登録')),
+                ]))
             else:
-                quick_reply = QuickReply(items=[
-                    QuickReplyItem(action=MessageAction(label='➕ 登録する', text='ゴミ登録')),
-                ])
-                reply = TextMessage(text='ゴミ出しスケジュールが未設定です。', quick_reply=quick_reply)
+                reply = TextMessage(text='ゴミ出しスケジュールが未設定です。', quick_reply=QuickReply(items=[
+                    QuickReplyItem(action=PostbackAction(label='➕ 登録する', data='action=ゴミ登録')),
+                ]))
 
-        elif text == 'ゴミ登録':
-            user_state[user_id] = {'action': 'set_trash_type'}
-            quick_reply = QuickReply(items=[
-                QuickReplyItem(action=MessageAction(label='燃えるゴミ', text='ゴミ種類_燃えるゴミ')),
-                QuickReplyItem(action=MessageAction(label='燃えないゴミ', text='ゴミ種類_燃えないゴミ')),
-                QuickReplyItem(action=MessageAction(label='資源ゴミ', text='ゴミ種類_資源ゴミ')),
-                QuickReplyItem(action=MessageAction(label='ペットボトル', text='ゴミ種類_ペットボトル')),
-                QuickReplyItem(action=MessageAction(label='びん', text='ゴミ種類_びん')),
-                QuickReplyItem(action=MessageAction(label='かん', text='ゴミ種類_かん')),
-                QuickReplyItem(action=MessageAction(label='粗大ゴミ', text='ゴミ種類_粗大ゴミ')),
-                QuickReplyItem(action=MessageAction(label='➕ その他', text='ゴミ種類_その他')),
-            ])
-            reply = TextMessage(text='ゴミの種類を選んでください🗑️', quick_reply=quick_reply)
+        elif action == 'ゴミ登録':
+            user_state[user_id] = {'action': 'set_trash_days'}
+            reply = TextMessage(text='ゴミの種類を選んでください🗑️', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='燃えるゴミ', data='action=ゴミ種類&value=燃えるゴミ')),
+                QuickReplyItem(action=PostbackAction(label='燃えないゴミ', data='action=ゴミ種類&value=燃えないゴミ')),
+                QuickReplyItem(action=PostbackAction(label='資源ゴミ', data='action=ゴミ種類&value=資源ゴミ')),
+                QuickReplyItem(action=PostbackAction(label='ペットボトル', data='action=ゴミ種類&value=ペットボトル')),
+                QuickReplyItem(action=PostbackAction(label='びん', data='action=ゴミ種類&value=びん')),
+                QuickReplyItem(action=PostbackAction(label='かん', data='action=ゴミ種類&value=かん')),
+                QuickReplyItem(action=PostbackAction(label='粗大ゴミ', data='action=ゴミ種類&value=粗大ゴミ')),
+                QuickReplyItem(action=PostbackAction(label='➕ その他', data='action=ゴミ種類その他')),
+            ]))
 
-        elif text.startswith('ゴミ種類_'):
-            trash_type = text.replace('ゴミ種類_', '')
-            if trash_type == 'その他':
-                user_state[user_id] = {'action': 'set_trash_type_custom'}
-                reply = TextMessage(text='ゴミの種類を入力してください。\n例: 古紙')
-            else:
-                user_state[user_id] = {'action': 'set_trash_days', 'trash_type': trash_type}
-                quick_reply = QuickReply(items=[
-                    QuickReplyItem(action=MessageAction(label='月', text='ゴミ曜日_月')),
-                    QuickReplyItem(action=MessageAction(label='火', text='ゴミ曜日_火')),
-                    QuickReplyItem(action=MessageAction(label='水', text='ゴミ曜日_水')),
-                    QuickReplyItem(action=MessageAction(label='木', text='ゴミ曜日_木')),
-                    QuickReplyItem(action=MessageAction(label='金', text='ゴミ曜日_金')),
-                    QuickReplyItem(action=MessageAction(label='土', text='ゴミ曜日_土')),
-                    QuickReplyItem(action=MessageAction(label='日', text='ゴミ曜日_日')),
-                ])
-                reply = TextMessage(text=f'「{trash_type}」の収集曜日を選んでください。', quick_reply=quick_reply)
+        elif action == 'ゴミ種類':
+            user_state[user_id] = {'action': 'set_trash_days', 'trash_type': value, 'days': ''}
+            reply = TextMessage(text=f'「{value}」の収集曜日を選んでください。', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='月', data='action=ゴミ曜日&value=月')),
+                QuickReplyItem(action=PostbackAction(label='火', data='action=ゴミ曜日&value=火')),
+                QuickReplyItem(action=PostbackAction(label='水', data='action=ゴミ曜日&value=水')),
+                QuickReplyItem(action=PostbackAction(label='木', data='action=ゴミ曜日&value=木')),
+                QuickReplyItem(action=PostbackAction(label='金', data='action=ゴミ曜日&value=金')),
+                QuickReplyItem(action=PostbackAction(label='土', data='action=ゴミ曜日&value=土')),
+                QuickReplyItem(action=PostbackAction(label='日', data='action=ゴミ曜日&value=日')),
+            ]))
 
-        elif user_id in user_state and user_state[user_id].get('action') == 'set_trash_type_custom':
-            trash_type = text
-            user_state[user_id] = {'action': 'set_trash_days', 'trash_type': trash_type}
-            quick_reply = QuickReply(items=[
-                QuickReplyItem(action=MessageAction(label='月', text='ゴミ曜日_月')),
-                QuickReplyItem(action=MessageAction(label='火', text='ゴミ曜日_火')),
-                QuickReplyItem(action=MessageAction(label='水', text='ゴミ曜日_水')),
-                QuickReplyItem(action=MessageAction(label='木', text='ゴミ曜日_木')),
-                QuickReplyItem(action=MessageAction(label='金', text='ゴミ曜日_金')),
-                QuickReplyItem(action=MessageAction(label='土', text='ゴミ曜日_土')),
-                QuickReplyItem(action=MessageAction(label='日', text='ゴミ曜日_日')),
-            ])
-            reply = TextMessage(text=f'「{trash_type}」の収集曜日を選んでください。', quick_reply=quick_reply)
+        elif action == 'ゴミ種類その他':
+            user_state[user_id] = {'action': 'set_trash_type_custom'}
+            reply = TextMessage(text='ゴミの種類を入力してください。\n例: 古紙')
 
-        elif text.startswith('ゴミ曜日_'):
-            day = text.replace('ゴミ曜日_', '')
+        elif action == 'ゴミ曜日':
             if user_id in user_state and user_state[user_id].get('action') == 'set_trash_days':
                 current_days = user_state[user_id].get('days', '')
-                if day not in current_days:
-                    current_days += day
+                if value not in current_days:
+                    current_days += value
                 user_state[user_id]['days'] = current_days
-                quick_reply = QuickReply(items=[
-                    QuickReplyItem(action=MessageAction(label='月', text='ゴミ曜日_月')),
-                    QuickReplyItem(action=MessageAction(label='火', text='ゴミ曜日_火')),
-                    QuickReplyItem(action=MessageAction(label='水', text='ゴミ曜日_水')),
-                    QuickReplyItem(action=MessageAction(label='木', text='ゴミ曜日_木')),
-                    QuickReplyItem(action=MessageAction(label='金', text='ゴミ曜日_金')),
-                    QuickReplyItem(action=MessageAction(label='土', text='ゴミ曜日_土')),
-                    QuickReplyItem(action=MessageAction(label='日', text='ゴミ曜日_日')),
-                    QuickReplyItem(action=MessageAction(label='✅ 完了', text='ゴミ曜日完了')),
-                ])
-                reply = TextMessage(text=f'選択中: {current_days}曜日\n他にもありますか？', quick_reply=quick_reply)
+                trash_type = user_state[user_id]['trash_type']
+                reply = TextMessage(text=f'選択中: {current_days}曜日\n他にもありますか？', quick_reply=QuickReply(items=[
+                    QuickReplyItem(action=PostbackAction(label='月', data='action=ゴミ曜日&value=月')),
+                    QuickReplyItem(action=PostbackAction(label='火', data='action=ゴミ曜日&value=火')),
+                    QuickReplyItem(action=PostbackAction(label='水', data='action=ゴミ曜日&value=水')),
+                    QuickReplyItem(action=PostbackAction(label='木', data='action=ゴミ曜日&value=木')),
+                    QuickReplyItem(action=PostbackAction(label='金', data='action=ゴミ曜日&value=金')),
+                    QuickReplyItem(action=PostbackAction(label='土', data='action=ゴミ曜日&value=土')),
+                    QuickReplyItem(action=PostbackAction(label='日', data='action=ゴミ曜日&value=日')),
+                    QuickReplyItem(action=PostbackAction(label='✅ 完了', data='action=ゴミ曜日完了')),
+                ]))
             else:
-                reply = TextMessage(text='「ゴミ登録」と送って最初からやり直してください。')
+                reply = TextMessage(text='「ゴミの日」から最初からやり直してください。')
 
-        elif text == 'ゴミ曜日完了':
+        elif action == 'ゴミ曜日完了':
             if user_id in user_state and user_state[user_id].get('action') == 'set_trash_days':
                 trash_type = user_state[user_id]['trash_type']
                 days = user_state[user_id].get('days', '')
@@ -415,24 +327,45 @@ def handle_message(event):
                 cur.close()
                 conn.close()
                 user_state.pop(user_id, None)
-                quick_reply = QuickReply(items=[
-                    QuickReplyItem(action=MessageAction(label='➕ 続けて登録', text='ゴミ登録')),
-                ])
-                reply = TextMessage(
-                    text=f'✅ {trash_type}を{days}曜日に登録しました！\n毎朝7時に通知します🗑️',
-                    quick_reply=quick_reply
-                )
+                reply = TextMessage(text=f'✅ {trash_type}を{days}曜日に登録しました！\n毎朝7時に通知します🗑️', quick_reply=QuickReply(items=[
+                    QuickReplyItem(action=PostbackAction(label='➕ 続けて登録', data='action=ゴミ登録')),
+                ]))
             else:
-                reply = TextMessage(text='「ゴミ登録」と送って最初からやり直してください。')
+                reply = TextMessage(text='「ゴミの日」から最初からやり直してください。')
+
+        elif action == '完了':
+            reply = TextMessage(text='設定が完了しました！✅')
 
         else:
-            reply = TextMessage(text=text)
+            reply = TextMessage(text='メニューから選んでください。')
+
+        send_reply(api_client, event.reply_token, reply)
+
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event):
+    text = event.message.text
+    user_id = event.source.user_id
+
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+
+        if user_id in user_state and user_state[user_id].get('action') == 'set_trash_type_custom':
+            trash_type = text
+            user_state[user_id] = {'action': 'set_trash_days', 'trash_type': trash_type, 'days': ''}
+            reply = TextMessage(text=f'「{trash_type}」の収集曜日を選んでください。', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='月', data='action=ゴミ曜日&value=月')),
+                QuickReplyItem(action=PostbackAction(label='火', data='action=ゴミ曜日&value=火')),
+                QuickReplyItem(action=PostbackAction(label='水', data='action=ゴミ曜日&value=水')),
+                QuickReplyItem(action=PostbackAction(label='木', data='action=ゴミ曜日&value=木')),
+                QuickReplyItem(action=PostbackAction(label='金', data='action=ゴミ曜日&value=金')),
+                QuickReplyItem(action=PostbackAction(label='土', data='action=ゴミ曜日&value=土')),
+                QuickReplyItem(action=PostbackAction(label='日', data='action=ゴミ曜日&value=日')),
+            ]))
+        else:
+            reply = TextMessage(text='メニューから選んでください。')
 
         line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[reply]
-            )
+            ReplyMessageRequest(reply_token=event.reply_token, messages=[reply])
         )
 
 with app.app_context():
