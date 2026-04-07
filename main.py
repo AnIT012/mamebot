@@ -359,9 +359,9 @@ def handle_postback(event):
                     QuickReplyItem(action=PostbackAction(label='✅ 完了', data='action=ゴミ曜日完了')),
                 ]))
             else:
-                reply = TextMessage(text='「ゴミの日」から最初からやり直してください。')
+                reply = TextMessage(text='「ゴミの日」から最初からやり直してください🙇‍♂️')
 
-        elif action == 'ゴミ曜日完了':
+        elif action == 'ゴミ曜日完了✅':
             if user_id in user_state and user_state[user_id].get('action') == 'set_trash_days':
                 trash_type = user_state[user_id]['trash_type']
                 days = user_state[user_id].get('days', '')
