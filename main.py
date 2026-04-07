@@ -1,8 +1,9 @@
 from flask import Flask, request, abort
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, PushMessageRequest, TextMessage, QuickReply, QuickReplyItem, MessageAction
+from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, PushMessageRequest, TextMessage, QuickReply, QuickReplyItem, MessageAction, PostbackAction
+from linebot.v3.messaging.models import RichMenuRequest, RichMenuSize, RichMenuArea, RichMenuBounds, URIAction
 from linebot.v3.webhook import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent
 import os
 import psycopg2
 from datetime import datetime, timedelta
@@ -106,6 +107,8 @@ def handle_message(event):
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
+
+
 
         # ========== ごはん ==========
         if text == 'ごはん':
@@ -333,6 +336,54 @@ def handle_message(event):
                 messages=[reply]
             )
         )
+
+def setup_rich_menu():
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            rich_menu = RichMenuRequest(
+                size=RichMenuSize(width=2500, height=1686),
+                selected=True,
+                name='まめBotメニュー',
+                chat_bar_text='メニュー',
+                areas=[
+                    RichMenuArea(
+                        bounds=RichMenuBounds(x=0, y=0, width=1250, height=843),
+                        action=PostbackAction(label='ごはん', data='action=ごはん')
+                    ),
+                    RichMenuArea(
+                        bounds=RichMenuBounds(x=1250, y=0, width=1250, height=843),
+                        action=PostbackAction(label='出発・帰宅', data='action=出発・帰宅')
+                    ),
+                    RichMenuArea(
+                        bounds=RichMenuBounds(x=0, y=843, width=1250, height=843),
+                        action=PostbackAction(label='お風呂', data='action=お風呂')
+                    ),
+                    RichMenuArea(
+                        bounds=RichMenuBounds(x=1250, y=843, width=1250, height=843),
+                        action=PostbackAction(label='ゴミの日', data='action=ゴミの日')
+                    ),
+                ]
+            )
+            rich_menu_id = line_bot_api.create_rich_menu(rich_menu).rich_menu_id
+            print(f'Rich menu created: {rich_menu_id}')
+            return rich_menu_id
+    except Exception as e:
+        print(f'Rich menu error: {e}')
+        return None
+
+@handler.add(PostbackEvent)
+def handle_postback(event):
+    data = event.postback.data
+    params = dict(item.split('=') for item in data.split('&'))
+    action = params.get('action', '')
+    
+    fake_event = type('obj', (object,), {
+        'message': type('obj', (object,), {'text': action})(),
+        'source': event.source,
+        'reply_token': event.reply_token
+    })()
+    handle_message(fake_event)
 
 with app.app_context():
     init_db()
