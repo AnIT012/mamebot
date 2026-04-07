@@ -140,7 +140,11 @@ def handle_message(event):
             reply = TextMessage(text='🍚 ご飯ができました！みんな集まってください！')
 
         else:
-            reply = TextMessage(text=text)
+            source = event.source
+            if hasattr(source, 'group_id'):
+                reply = TextMessage(text=f'グループID: {source.group_id}')
+            else:
+                reply = TextMessage(text=text)
 
         line_bot_api.reply_message(
             ReplyMessageRequest(
