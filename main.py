@@ -75,6 +75,21 @@ def init_db():
             created_date DATE DEFAULT CURRENT_DATE
         )
     ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS dinner_schedule (
+            id SERIAL PRIMARY KEY,
+            notify_time TIME
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS dinner_response (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT,
+            user_name TEXT,
+            response TEXT,
+            created_date DATE DEFAULT CURRENT_DATE
+        )
+    ''')
     conn.commit()
     cur.close()
     conn.close()
@@ -139,6 +154,14 @@ def reminder_loop():
                 diff = abs((now - notify_dt).total_seconds())
                 if diff < 60:
                     push_group('🚃 今日の帰宅・出発時間を教えてください！\nまめBotの個別チャットで「出発・帰宅」から共有してください。')
+
+            cur.execute('SELECT notify_time FROM dinner_schedule LIMIT 1')
+            row = cur.fetchone()
+            if row:
+                notify_dt = datetime.combine(now.date(), row[0])
+                diff = abs((now - notify_dt).total_seconds())
+                if diff < 90:
+                    push_group('🍚 今日の夕食どうしますか？\nまめBotの個別チャットで「ごはん」→「夕食回答」から教えてください！')
 
             cur.close()
             conn.close()
@@ -216,6 +239,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             QuickReplyItem(action=PostbackAction(label='🌅 朝', data='action=ごはん選択&value=朝')),
             QuickReplyItem(action=PostbackAction(label='☀️ 昼', data='action=ごはん選択&value=昼')),
             QuickReplyItem(action=PostbackAction(label='🌙 夜', data='action=ごはん選択&value=夜')),
+            QuickReplyItem(action=PostbackAction(label='🍽️ 夕食回答', data='action=夕食回答')),
             QuickReplyItem(action=PostbackAction(label='🔔 できました！', data='action=ごはんできた')),
         ]))
 
@@ -273,7 +297,74 @@ def process_action(action, value, context, user_id, api_client, reply_token):
                 QuickReplyItem(action=PostbackAction(label='✅ 終わり', data='action=完了')),
             ])
         )
+    elif action == '夕食回答':
+        user_state[user_id] = {'action': 'dinner_response'}
+        reply = TextMessage(text='今日の夕食はどうしますか？', quick_reply=QuickReply(items=[
+            QuickReplyItem(action=PostbackAction(label='🏠 家で食べる', data='action=夕食登録&value=家で食べる🏠')),
+            QuickReplyItem(action=PostbackAction(label='🍴 外で食べる', data='action=夕食登録&value=外で食べる🍴')),
+            QuickReplyItem(action=PostbackAction(label='❓ 未定', data='action=夕食登録&value=未定❓')),
+        ]))
 
+    elif action == '夕食登録':
+        try:
+            name = MessagingApi(api_client).get_profile(user_id).display_name
+        except:
+            name = 'だれか'
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            'INSERT INTO dinner_response (user_id, user_name, response, created_date) VALUES (%s, %s, %s, CURRENT_DATE) ON CONFLICT DO NOTHING',
+            (user_id, name, value)
+        )
+        # 今日の全回答を取得
+        cur.execute('SELECT user_name, response FROM dinner_response WHERE created_date = CURRENT_DATE')
+        responses = cur.fetchall()
+        # 未回答メンバーを取得
+        cur.execute('SELECT display_name FROM members WHERE user_id NOT IN (SELECT user_id FROM dinner_response WHERE created_date = CURRENT_DATE)')
+        unanswered = cur.fetchall()
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        summary = '🍚 夕食まとめ'
+        for r_name, r_response in responses:
+            summary += f'\n{r_name}: {r_response}'
+        for (u_name,) in unanswered:
+            summary += f'\n{u_name}: 未回答'
+        push_group(summary)
+        user_state.pop(user_id, None)
+        reply = TextMessage(text='回答を送りました！家族グループに一覧を送信しました☑️')
+
+    elif action == '夕食送信設定':
+        user_state[user_id] = {'action': 'set_dinner_ampm'}
+        reply = TextMessage(text='何時に送信しますか？', quick_reply=QuickReply(items=[
+            QuickReplyItem(action=PostbackAction(label='午前', data='action=夕食時間帯&value=am')),
+            QuickReplyItem(action=PostbackAction(label='午後', data='action=夕食時間帯&value=pm')),
+        ]))
+
+    elif action == '夕食時間帯':
+        hours = AM_HOURS if value == 'am' else PM_HOURS
+        user_state[user_id]['action'] = 'set_dinner_hour'
+        reply = TextMessage(text='何時ですか？', quick_reply=make_hour_qr(hours, 'dinner'))
+
+    elif action == '時' and context == 'dinner':
+        user_state[user_id]['hour'] = int(value)
+        user_state[user_id]['action'] = 'set_dinner_minute'
+        reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('dinner'))
+
+    elif action == '分' and context == 'dinner':
+        hour = user_state[user_id].get('hour')
+        minute = int(value)
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('DELETE FROM dinner_schedule')
+        cur.execute('INSERT INTO dinner_schedule (notify_time) VALUES (%s)', (f'{hour:02d}:{minute:02d}',))
+        conn.commit()
+        cur.close()
+        conn.close()
+        user_state.pop(user_id, None)
+        reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}に夕食確認を送ります！')
+        
     elif action == 'ごはんできた':
         push_group('🍚 ご飯ができました！みんな集まってください！')
         reply = TextMessage(text='家族グループに送りました！')
