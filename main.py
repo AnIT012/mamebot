@@ -2,13 +2,14 @@ from flask import Flask, request, abort
 from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, PushMessageRequest, TextMessage, QuickReply, QuickReplyItem, MessageAction, PostbackAction
 from linebot.v3.webhook import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent, JoinEvent, FollowEvent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent, JoinEvent, FollowEvent, LeaveEvent
 import os
 import psycopg2
 from datetime import datetime, timedelta, timezone
 import threading
 import time
 import requests as http_requests
+
 
 app = Flask(__name__)
 
@@ -55,9 +56,15 @@ def init_db():
     cur.execute('''
         CREATE TABLE IF NOT EXISTS groups (
             id SERIAL PRIMARY KEY,
-            group_id TEXT UNIQUE
+            group_id TEXT UNIQUE,
+            active BOOLEAN DEFAULT FALSE
         )
     ''')
+    try:
+        cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT FALSE')
+    except:
+        pass
+
     cur.execute('''
         CREATE TABLE IF NOT EXISTS members (
             id SERIAL PRIMARY KEY,
@@ -107,7 +114,7 @@ def get_group_ids():
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute('SELECT group_id FROM groups')
+        cur.execute('SELECT group_id FROM groups WHERE active = TRUE')
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -767,7 +774,8 @@ def handle_join(event):
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute('INSERT INTO groups (group_id) VALUES (%s) ON CONFLICT (group_id) DO NOTHING', (group_id,))
+        cur.execute('UPDATE groups SET active = FALSE')
+        cur.execute('INSERT INTO groups (group_id, active) VALUES (%s, TRUE) ON CONFLICT (group_id) DO UPDATE SET active = TRUE', (group_id,))
         conn.commit()
         cur.close()
         conn.close()
@@ -798,6 +806,20 @@ def handle_join(event):
                 )]
             )
         )
+
+@handler.add(LeaveEvent)
+def handle_leave(event):
+    group_id = event.source.group_id
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('DELETE FROM groups WHERE group_id = %s', (group_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f'Group removed: {group_id}')
+    except Exception as e:
+        print(f'Group removal error: {e}')
 
 
 with app.app_context():
