@@ -641,7 +641,8 @@ def handle_join(event):
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         bot_info = line_bot_api.get_bot_info()
-        friend_url = f'https://line.me/R/ti/p/@{bot_info.basic_id}'
+        basic_id = bot_info.basic_id.lstrip('@')
+        friend_url = f'https://line.me/R/ti/p/@{basic_id}'
         line_bot_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
