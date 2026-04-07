@@ -566,8 +566,31 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         ]))
 
     elif action == '帰宅確認今すぐ':
-        push_group('🚃 今日の帰宅・出発時間を教えてください！\nまめBotの個別チャットで「出発・帰宅」から共有してください。')
-        reply = TextMessage(text='家族グループに確認メッセージを送りました☑️')
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT user_id FROM members')
+        member_ids = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")}'
+        }
+        for (mid,) in member_ids:
+            data = {
+                'to': mid,
+                'messages': [{
+                    'type': 'text',
+                    'text': '🚃 帰宅・出発時間の確認です！\nメニューの「出発・帰宅」から時間を共有してください😊'
+                }]
+            }
+            http_requests.post(
+                'https://api.line.me/v2/bot/message/push',
+                headers=headers,
+                json=data
+            )
+        reply = TextMessage(text=f'全員({len(member_ids)}人)に確認メッセージを送りました☑️')
 
     elif action == '帰宅確認時間設定':
         user_state[user_id] = {'action': 'set_depart_check_ampm'}
