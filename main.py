@@ -249,8 +249,8 @@ def handle_postback(event):
         elif action == '出発・帰宅':
             user_state.pop(user_id, None)
             reply = TextMessage(text='共有しますか？確認しますか？', quick_reply=QuickReply(items=[
-                QuickReplyItem(action=PostbackAction(label='📤 共有する', data='action=帰宅共有メニュー')),
-                QuickReplyItem(action=PostbackAction(label='📥 確認する', data='action=帰宅確認')),
+                QuickReplyItem(action=PostbackAction(label='📤 時間を共有する', data='action=帰宅共有メニュー')),
+                QuickReplyItem(action=PostbackAction(label='📥 時間を確認する', data='action=帰宅確認')),
             ]))
 
         elif action == '帰宅共有メニュー':
