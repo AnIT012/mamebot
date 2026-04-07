@@ -259,7 +259,7 @@ def handle_postback(event):
                 QuickReplyItem(action=PostbackAction(label='🚃 出発', data='action=帰宅種類&value=出発')),
             ]))
 
-        elif action == '帰宅種類':
+        elif action == '帰宅の種類':
             user_state[user_id] = {'action': 'share_time_hour', 'kind': value}
             reply = TextMessage(text=f'{value}は何時台ですか？', quick_reply=make_hour_qr(EVENING_HOURS, 'share'))
 
