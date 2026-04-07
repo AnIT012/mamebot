@@ -323,16 +323,54 @@ def handle_message(event):
             conn.close()
             if rows:
                 schedule_text = '\n'.join([f'・{t}: {w}曜日' for t, w in rows])
-                reply = TextMessage(text=f'現在のゴミ出しスケジュール📅\n{schedule_text}\n\n変更する場合は「ゴミ登録」と送ってください。')
+                quick_reply = QuickReply(items=[
+                    QuickReplyItem(action=MessageAction(label='➕ 追加・変更', text='ゴミ登録')),
+                ])
+                reply = TextMessage(
+                    text=f'現在のゴミ出しスケジュール📅\n{schedule_text}',
+                    quick_reply=quick_reply
+                )
             else:
-                reply = TextMessage(text='ゴミ出しスケジュールが未設定です。\n「ゴミ登録」と送って設定してください。')
+                quick_reply = QuickReply(items=[
+                    QuickReplyItem(action=MessageAction(label='➕ 登録する', text='ゴミ登録')),
+                ])
+                reply = TextMessage(text='ゴミ出しスケジュールが未設定です。', quick_reply=quick_reply)
 
         elif text == 'ゴミ登録':
             user_state[user_id] = {'action': 'set_trash_type'}
-            reply = TextMessage(text='ゴミの種類を入力してください。\n例: 燃えるゴミ')
+            quick_reply = QuickReply(items=[
+                QuickReplyItem(action=MessageAction(label='燃えるゴミ', text='ゴミ種類_燃えるゴミ')),
+                QuickReplyItem(action=MessageAction(label='燃えないゴミ', text='ゴミ種類_燃えないゴミ')),
+                QuickReplyItem(action=MessageAction(label='資源ゴミ', text='ゴミ種類_資源ゴミ')),
+                QuickReplyItem(action=MessageAction(label='ペットボトル', text='ゴミ種類_ペットボトル')),
+                QuickReplyItem(action=MessageAction(label='びん', text='ゴミ種類_びん')),
+                QuickReplyItem(action=MessageAction(label='かん', text='ゴミ種類_かん')),
+                QuickReplyItem(action=MessageAction(label='粗大ゴミ', text='ゴミ種類_粗大ゴミ')),
+                QuickReplyItem(action=MessageAction(label='➕ その他', text='ゴミ種類_その他')),
+            ])
+            reply = TextMessage(text='ゴミの種類を選んでください🗑️', quick_reply=quick_reply)
 
-        elif user_id in user_state and user_state[user_id].get('action') == 'set_trash_type':
-            user_state[user_id] = {'action': 'set_trash_days', 'trash_type': text}
+        elif text.startswith('ゴミ種類_'):
+            trash_type = text.replace('ゴミ種類_', '')
+            if trash_type == 'その他':
+                user_state[user_id] = {'action': 'set_trash_type_custom'}
+                reply = TextMessage(text='ゴミの種類を入力してください。\n例: 古紙')
+            else:
+                user_state[user_id] = {'action': 'set_trash_days', 'trash_type': trash_type}
+                quick_reply = QuickReply(items=[
+                    QuickReplyItem(action=MessageAction(label='月', text='ゴミ曜日_月')),
+                    QuickReplyItem(action=MessageAction(label='火', text='ゴミ曜日_火')),
+                    QuickReplyItem(action=MessageAction(label='水', text='ゴミ曜日_水')),
+                    QuickReplyItem(action=MessageAction(label='木', text='ゴミ曜日_木')),
+                    QuickReplyItem(action=MessageAction(label='金', text='ゴミ曜日_金')),
+                    QuickReplyItem(action=MessageAction(label='土', text='ゴミ曜日_土')),
+                    QuickReplyItem(action=MessageAction(label='日', text='ゴミ曜日_日')),
+                ])
+                reply = TextMessage(text=f'「{trash_type}」の収集曜日を選んでください。', quick_reply=quick_reply)
+
+        elif user_id in user_state and user_state[user_id].get('action') == 'set_trash_type_custom':
+            trash_type = text
+            user_state[user_id] = {'action': 'set_trash_days', 'trash_type': trash_type}
             quick_reply = QuickReply(items=[
                 QuickReplyItem(action=MessageAction(label='月', text='ゴミ曜日_月')),
                 QuickReplyItem(action=MessageAction(label='火', text='ゴミ曜日_火')),
@@ -342,7 +380,7 @@ def handle_message(event):
                 QuickReplyItem(action=MessageAction(label='土', text='ゴミ曜日_土')),
                 QuickReplyItem(action=MessageAction(label='日', text='ゴミ曜日_日')),
             ])
-            reply = TextMessage(text=f'「{text}」の収集曜日を選んでください。', quick_reply=quick_reply)
+            reply = TextMessage(text=f'「{trash_type}」の収集曜日を選んでください。', quick_reply=quick_reply)
 
         elif text.startswith('ゴミ曜日_'):
             day = text.replace('ゴミ曜日_', '')
@@ -377,7 +415,13 @@ def handle_message(event):
                 cur.close()
                 conn.close()
                 user_state.pop(user_id, None)
-                reply = TextMessage(text=f'✅ {trash_type}を{days}曜日に登録しました！\n毎朝7時に通知します🗑️')
+                quick_reply = QuickReply(items=[
+                    QuickReplyItem(action=MessageAction(label='➕ 続けて登録', text='ゴミ登録')),
+                ])
+                reply = TextMessage(
+                    text=f'✅ {trash_type}を{days}曜日に登録しました！\n毎朝7時に通知します🗑️',
+                    quick_reply=quick_reply
+                )
             else:
                 reply = TextMessage(text='「ゴミ登録」と送って最初からやり直してください。')
 
