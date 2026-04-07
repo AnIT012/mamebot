@@ -64,7 +64,6 @@ def init_db():
         cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT FALSE')
     except:
         pass
-
     cur.execute('''
         CREATE TABLE IF NOT EXISTS members (
             id SERIAL PRIMARY KEY,
@@ -129,6 +128,27 @@ def get_group_ids():
         fallback = os.environ.get('LINE_GROUP_ID')
         return [fallback] if fallback else []
 
+def push_members(text):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT user_id FROM members')
+        member_ids = cur.fetchall()
+        cur.close()
+        conn.close()
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")}'
+        }
+        for (mid,) in member_ids:
+            http_requests.post(
+                'https://api.line.me/v2/bot/message/push',
+                headers=headers,
+                json={'to': mid, 'messages': [{'type': 'text', 'text': text}]}
+            )
+    except Exception as e:
+        print(f'Push members error: {e}')
+
 def reminder_loop():
     while True:
         try:
@@ -169,7 +189,7 @@ def reminder_loop():
                 notify_dt = datetime.combine(now.date(), row[0])
                 diff = abs((now - notify_dt).total_seconds())
                 if diff < 90:
-                    push_group('🚃 今日の帰宅・出発時間を教えてください！\nまめBotの個別チャットで「出発・帰宅」から共有してください。')
+                    push_members('🚃 帰宅・出発時間の確認です！\nメニューの「出発・帰宅」から時間を共有してください😊')
 
             cur.execute('SELECT notify_time FROM dinner_schedule LIMIT 1')
             row = cur.fetchone()
@@ -177,7 +197,7 @@ def reminder_loop():
                 notify_dt = datetime.combine(now.date(), row[0])
                 diff = abs((now - notify_dt).total_seconds())
                 if diff < 90:
-                    push_group('🍚 今日の夕食どうしますか？\nまめBotの個別チャットで「ごはん」→「夕食回答」から教えてください！')
+                    push_members('🍚 今日の夕食はどうしますか？\nメニューの「ごはん」→「夕食回答」から教えてください😊')
 
             cur.close()
             conn.close()
@@ -256,6 +276,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             QuickReplyItem(action=PostbackAction(label='☀️ 昼', data='action=ごはん選択&value=昼')),
             QuickReplyItem(action=PostbackAction(label='🌙 夜', data='action=ごはん選択&value=夜')),
             QuickReplyItem(action=PostbackAction(label='🍽️ 夕食回答', data='action=夕食回答')),
+            QuickReplyItem(action=PostbackAction(label='⏰ 夕食確認を設定', data='action=夕食送信設定')),
             QuickReplyItem(action=PostbackAction(label='🔔 できました！', data='action=ごはんできた')),
         ]))
 
@@ -566,31 +587,14 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         ]))
 
     elif action == '帰宅確認今すぐ':
+        push_members('🚃 帰宅・出発時間の確認です！\nメニューの「出発・帰宅」から時間を共有してください😊')
         conn = get_db()
         cur = conn.cursor()
-        cur.execute('SELECT user_id FROM members')
-        member_ids = cur.fetchall()
+        cur.execute('SELECT COUNT(*) FROM members')
+        count = cur.fetchone()[0]
         cur.close()
         conn.close()
-        
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")}'
-        }
-        for (mid,) in member_ids:
-            data = {
-                'to': mid,
-                'messages': [{
-                    'type': 'text',
-                    'text': '🚃 帰宅・出発時間の確認です！\nメニューの「出発・帰宅」から時間を共有してください😊'
-                }]
-            }
-            http_requests.post(
-                'https://api.line.me/v2/bot/message/push',
-                headers=headers,
-                json=data
-            )
-        reply = TextMessage(text=f'全員({len(member_ids)}人)に確認メッセージを送りました☑️')
+        reply = TextMessage(text=f'全員({count}人)に確認メッセージを送りました☑️')
 
     elif action == '帰宅確認時間設定':
         user_state[user_id] = {'action': 'set_depart_check_ampm'}
@@ -750,6 +754,17 @@ def handle_message(event):
         elif text in ['ごはん', 'お風呂', '出発・帰宅', 'ゴミの日']:
             process_action(text, '', '', user_id, api_client, event.reply_token)
 
+        elif text == '使い方':
+            reply = TextMessage(text=
+                '📖 まめBot 使い方\n\n'
+                '🍚 ごはん\n朝・昼・夜のごはん時間を登録してリマインドを設定できます。ごはんができたら一斉通知も！夕食の予定も家族に共有できます。\n\n'
+                '🚃 出発・帰宅\n今日の出発・帰宅時間とご飯の有無を家族に共有できます。確認メッセージを全員に送ることもできます。\n\n'
+                '🛁 お風呂\nお風呂を洗ったか家族に報告・お願いができます。毎日決まった時間にお風呂確認を自動送信する設定も可能です。\n\n'
+                '🗑️ ゴミの日\nゴミの種類と収集曜日を登録すると毎朝7時に自動通知されます。\n\n'
+                '💡 設定した内容はすべて家族グループに通知されます。'
+            )
+            send_reply(api_client, event.reply_token, reply)
+
         else:
             send_reply(api_client, event.reply_token, TextMessage(text='メニューから選んでください。'))
 
@@ -781,12 +796,8 @@ def handle_follow(event):
                 messages=[TextMessage(text=
                     'こんにちは！まめBotです🫘\n\n'
                     '家族の日常をもっとスムーズにするお手伝いをします。\n\n'
-                    '【できること】\n'
-                    '🍚 ごはんの時間をリマインド\n'
-                    '🚃 出発・帰宅時間を家族に共有\n'
-                    '🛁 お風呂の状況をお知らせ\n'
-                    '🗑️ ゴミの日を通知\n\n'
-                    '下のメニューから使ってみてください！'
+                    '下のメニューから使ってみてください！\n'
+                    '使い方を見るには「使い方」と送ってください📖'
                 )]
             )
         )
@@ -818,18 +829,16 @@ def handle_join(event):
                 messages=[TextMessage(text=
                     'まめBotがグループに参加しました🫘\n\n'
                     '家族の日常をもっとスムーズにするお手伝いをします。\n\n'
-                    '【できること】\n'
-                    '🍚 ごはんの時間リマインド\n'
-                    '🚃 出発・帰宅時間の共有\n'
-                    '🛁 お風呂の状況お知らせ\n'
-                    '🗑️ ゴミの日通知\n\n'
-                    'まめBotに話しかけるには、\n'
-                    '個別チャットで友達追加してください！\n'
-                    f'↓\n{friend_url}\n\n'
-                    '設定はまめBotとの個別チャットから\nメニューを使ってできます😊'
+                    '【手順】\n'
+                    '① 下のリンクからまめBotを個別で友達追加\n'
+                    '② 個別チャットのメニューから操作\n'
+                    '③ 設定内容がこのグループに届きます\n\n'
+                    '友達追加はこちら↓\n'
+                    f'{friend_url}'
                 )]
             )
         )
+
 
 @handler.add(LeaveEvent)
 def handle_leave(event):
