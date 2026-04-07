@@ -89,7 +89,7 @@ def handle_message(event):
                 QuickReplyItem(action=MessageAction(label='🌅 朝', text='ごはん_朝')),
                 QuickReplyItem(action=MessageAction(label='☀️ 昼', text='ごはん_昼')),
                 QuickReplyItem(action=MessageAction(label='🌙 夜', text='ごはん_夜')),
-                QuickReplyItem(action=MessageAction(label='🔔 できました！', text='ごはんできた')),
+                QuickReplyItem(action=MessageAction(label='🔔 ご飯できました！', text='ごはんできた')),
             ])
             reply = TextMessage(text='どの時間帯を設定しますか？', quick_reply=quick_reply)
 
@@ -97,7 +97,7 @@ def handle_message(event):
             mapping = {'ごはん_朝': '朝', 'ごはん_昼': '昼', 'ごはん_夜': '夜'}
             meal = mapping[text]
             user_state[user_id] = {'action': 'set_meal', 'meal_type': meal}
-            reply = TextMessage(text=f'{meal}ごはんの時間を入力してください。\n例: 19:00')
+            reply = TextMessage(text=f'{meal}ごはんの時間を入力してください！🍚\n例: 19:00')
 
         elif user_id in user_state and user_state[user_id].get('action') == 'set_meal':
             time_pattern = re.compile(r'^(\d{1,2}):(\d{2})$')
@@ -128,9 +128,9 @@ def handle_message(event):
                         quick_reply=quick_reply
                     )
                 else:
-                    reply = TextMessage(text='正しい時間を入力してください。\n例: 19:00')
+                    reply = TextMessage(text='正しい時間を入力してください！🙇\n例: 19:00')
             else:
-                reply = TextMessage(text='時間の形式が正しくありません。\n例: 19:00')
+                reply = TextMessage(text='時間の形式が正しくないです！😭\n例: 19:00')
 
         elif text == 'ごはん設定完了':
             reply = TextMessage(text='ごはんの設定が完了しました！🍚')
