@@ -65,6 +65,16 @@ def init_db():
             display_name TEXT
         )
     ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS daily_schedule (
+            id SERIAL PRIMARY KEY,
+            user_name TEXT,
+            depart_time TEXT,
+            arrive_time TEXT,
+            meal_status TEXT,
+            created_date DATE DEFAULT CURRENT_DATE
+        )
+    ''')
     conn.commit()
     cur.close()
     conn.close()
@@ -404,13 +414,45 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             name = MessagingApi(api_client).get_profile(user_id).display_name
         except:
             name = 'だれか'
-        parts = [f'🚃 {name}']
-        if depart:
-            parts.append(f'出発 {depart}')
-        if arrive:
-            parts.append(f'帰宅 {arrive}')
-        parts.append(value)
-        push_group(' / '.join(parts))
+        
+        # 今日のデータを保存
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            'INSERT INTO daily_schedule (user_name, depart_time, arrive_time, meal_status, created_date) VALUES (%s, %s, %s, %s, CURRENT_DATE)',
+            (name, depart, arrive, value)
+        )
+        
+        # 今日の全員分を取得
+        cur.execute('SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule WHERE created_date = CURRENT_DATE ORDER BY id')
+        rows = cur.fetchall()
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        if len(rows) == 1:
+            # 1人目はシンプルに送信
+            parts = [f'🚃 {name}']
+            if depart:
+                parts.append(f'出発 {depart}')
+            if arrive:
+                parts.append(f'帰宅 {arrive}')
+            parts.append(value)
+            push_group(' / '.join(parts))
+        else:
+            # 2人目以降はまとめて送信
+            summary = '🚃 本日の帰宅・出発まとめ'
+            for r_name, r_depart, r_arrive, r_meal in rows:
+                line_parts = [r_name]
+                if r_depart:
+                    line_parts.append(f'出発 {r_depart}')
+                if r_arrive:
+                    line_parts.append(f'帰宅 {r_arrive}')
+                if r_meal:
+                    line_parts.append(r_meal)
+                summary += f'\n{" / ".join(line_parts)}'
+            push_group(summary)
+        
         user_state.pop(user_id, None)
         reply = TextMessage(text='家族グループに送りました☑️')
 
