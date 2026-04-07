@@ -2,7 +2,7 @@ from flask import Flask, request, abort
 from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, PushMessageRequest, TextMessage, QuickReply, QuickReplyItem, MessageAction, PostbackAction
 from linebot.v3.webhook import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent, JoinEvent, FollowEvent
 import os
 import psycopg2
 from datetime import datetime, timedelta
@@ -340,6 +340,53 @@ def handle_postback(event):
             reply = TextMessage(text='メニューから選んでください。')
 
         send_reply(api_client, event.reply_token, reply)
+
+from linebot.v3.webhooks import JoinEvent, FollowEvent
+
+@handler.add(FollowEvent)
+def handle_follow(event):
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=
+                    'こんにちは！まめBotです🫘\n\n'
+                    '家族の日常をもっとスムーズにするお手伝いをします。\n\n'
+                    '【できること】\n'
+                    '🍚 ごはんの時間をリマインド\n'
+                    '🚃 出発・帰宅時間を家族に共有\n'
+                    '🛁 お風呂の状況をお知らせ\n'
+                    '🗑️ ゴミの日を通知\n\n'
+                    '下のメニューから使ってみてください！'
+                )]
+            )
+        )
+
+@handler.add(JoinEvent)
+def handle_join(event):
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        bot_info = line_bot_api.get_bot_info()
+        friend_url = f'https://line.me/R/ti/p/@{bot_info.basic_id}'
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=
+                    'まめBotがグループに参加しました🫘\n\n'
+                    '家族の日常をもっとスムーズにするお手伝いをします。\n\n'
+                    '【できること】\n'
+                    '🍚 ごはんの時間リマインド\n'
+                    '🚃 出発・帰宅時間の共有\n'
+                    '🛁 お風呂の状況お知らせ\n'
+                    '🗑️ ゴミの日通知\n\n'
+                    'まめBotに話しかけるには、\n'
+                    '個別チャットで友達追加してください！\n'
+                    f'↓\n{friend_url}\n\n'
+                    '設定はまめBotとの個別チャットから\nメニューを使ってできます😊'
+                )]
+            )
+        )
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
