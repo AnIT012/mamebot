@@ -15,7 +15,6 @@ app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 DATABASE_URL = os.environ.get('DATABASE_URL')
-GROUP_ID = os.environ.get('LINE_GROUP_ID')
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
@@ -53,9 +52,40 @@ def init_db():
             notify_time TIME
         )
     ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS groups (
+            id SERIAL PRIMARY KEY,
+            group_id TEXT UNIQUE
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS members (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT UNIQUE,
+            display_name TEXT
+        )
+    ''')
     conn.commit()
     cur.close()
     conn.close()
+
+def get_group_ids():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT group_id FROM groups')
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        ids = [row[0] for row in rows]
+        if not ids:
+            fallback = os.environ.get('LINE_GROUP_ID')
+            if fallback:
+                ids = [fallback]
+        return ids
+    except:
+        fallback = os.environ.get('LINE_GROUP_ID')
+        return [fallback] if fallback else []
 
 def reminder_loop():
     while True:
@@ -79,7 +109,7 @@ def reminder_loop():
                 if today in weekdays:
                     notify_dt = datetime.combine(now.date(), notify_time)
                     diff = abs((now - notify_dt).total_seconds())
-                    if diff < 60 and GROUP_ID:
+                    if diff < 60:
                         push_group(f'🗑️ 今日は{trash_type}の日です！忘れずに！')
 
             cur.execute('SELECT notify_time FROM bath_schedule LIMIT 1')
@@ -87,15 +117,15 @@ def reminder_loop():
             if row:
                 notify_dt = datetime.combine(now.date(), row[0])
                 diff = abs((now - notify_dt).total_seconds())
-                if diff < 60 and GROUP_ID:
+                if diff < 60:
                     push_group('🛁 お風呂洗ってありますか？')
-            
+
             cur.execute('SELECT notify_time FROM depart_check_schedule LIMIT 1')
             row = cur.fetchone()
             if row:
                 notify_dt = datetime.combine(now.date(), row[0])
                 diff = abs((now - notify_dt).total_seconds())
-                if diff < 60 and GROUP_ID:
+                if diff < 60:
                     push_group('🚃 今日の帰宅・出発時間を教えてください！\nまめBotの個別チャットで「出発・帰宅」から共有してください。')
 
             cur.close()
@@ -140,33 +170,34 @@ def send_reply(api_client, reply_token, reply):
     )
 
 def push_group(text):
-    if GROUP_ID:
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")}'
-        }
-        data = {
-            'to': GROUP_ID,
-            'messages': [{
-                'type': 'textV2',
-                'text': '{mention}\n' + text,
-                'substitution': {
-                    'mention': {
-                        'type': 'mention',
-                        'mentionee': {'type': 'all'}
+    group_ids = get_group_ids()
+    for gid in group_ids:
+        if gid:
+            headers = {
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")}'
+            }
+            data = {
+                'to': gid,
+                'messages': [{
+                    'type': 'textV2',
+                    'text': '{mention}\n' + text,
+                    'substitution': {
+                        'mention': {
+                            'type': 'mention',
+                            'mentionee': {'type': 'all'}
+                        }
                     }
-                }
-            }]
-        }
-        http_requests.post(
-            'https://api.line.me/v2/bot/message/push',
-            headers=headers,
-            json=data
-        )
+                }]
+            }
+            http_requests.post(
+                'https://api.line.me/v2/bot/message/push',
+                headers=headers,
+                json=data
+            )
 
 def process_action(action, value, context, user_id, api_client, reply_token):
 
-    # ========== ごはん ==========
     if action == 'ごはん':
         user_state.pop(user_id, None)
         reply = TextMessage(text='どの時間帯を設定しますか？', quick_reply=QuickReply(items=[
@@ -207,12 +238,14 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         remind_minutes = int(value)
         meal_type = user_state[user_id]['meal_type']
         meal_time = user_state[user_id]['meal_time']
+        group_ids = get_group_ids()
+        gid = group_ids[0] if group_ids else ''
         conn = get_db()
         cur = conn.cursor()
         cur.execute('DELETE FROM meal_times WHERE meal_type=%s', (meal_type,))
         cur.execute(
             'INSERT INTO meal_times (meal_type, meal_time, remind_minutes, group_id) VALUES (%s, %s, %s, %s)',
-            (meal_type, meal_time, remind_minutes, GROUP_ID)
+            (meal_type, meal_time, remind_minutes, gid)
         )
         conn.commit()
         cur.close()
@@ -233,7 +266,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         push_group('🍚 ご飯ができました！みんな集まってください！')
         reply = TextMessage(text='家族グループに送りました！')
 
-    # ========== お風呂 ==========
     elif action == 'お風呂':
         user_state.pop(user_id, None)
         try:
@@ -288,7 +320,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         user_state.pop(user_id, None)
         reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}にお風呂の確認を送ります！')
 
-    # ========== 出発・帰宅 ==========
     elif action == '出発・帰宅':
         user_state.pop(user_id, None)
         reply = TextMessage(text='共有しますか？確認しますか？', quick_reply=QuickReply(items=[
@@ -421,7 +452,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         user_state.pop(user_id, None)
         reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}に帰宅確認を送ります！')
 
-    # ========== ゴミの日 ==========
     elif action == 'ゴミの日':
         user_state.pop(user_id, None)
         conn = get_db()
@@ -556,8 +586,25 @@ def handle_message(event):
 
 @handler.add(FollowEvent)
 def handle_follow(event):
+    user_id = event.source.user_id
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
+        try:
+            profile = line_bot_api.get_profile(user_id)
+            name = profile.display_name
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute(
+                'INSERT INTO members (user_id, display_name) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET display_name=%s',
+                (user_id, name, name)
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            print(f'Member registered: {name}')
+        except Exception as e:
+            print(f'Member registration error: {e}')
+
         line_bot_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
@@ -577,6 +624,18 @@ def handle_follow(event):
 
 @handler.add(JoinEvent)
 def handle_join(event):
+    group_id = event.source.group_id
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('INSERT INTO groups (group_id) VALUES (%s) ON CONFLICT (group_id) DO NOTHING', (group_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f'Group registered: {group_id}')
+    except Exception as e:
+        print(f'Group registration error: {e}')
+
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         bot_info = line_bot_api.get_bot_info()
