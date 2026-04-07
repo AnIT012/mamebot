@@ -68,6 +68,7 @@ def init_db():
     cur.execute('''
         CREATE TABLE IF NOT EXISTS daily_schedule (
             id SERIAL PRIMARY KEY,
+            user_id TEXT,
             user_name TEXT,
             depart_time TEXT,
             arrive_time TEXT,
@@ -90,6 +91,14 @@ def init_db():
             created_date DATE DEFAULT CURRENT_DATE
         )
     ''')
+    try:
+        cur.execute('ALTER TABLE daily_schedule ADD CONSTRAINT unique_daily_user UNIQUE (user_id, created_date)')
+    except:
+        pass
+    try:
+        cur.execute('ALTER TABLE dinner_response ADD CONSTRAINT unique_dinner_user UNIQUE (user_id, created_date)')
+    except:
+        pass
     conn.commit()
     cur.close()
     conn.close()
@@ -117,8 +126,7 @@ def reminder_loop():
         try:
             conn = get_db()
             cur = conn.cursor()
-            from datetime import timezone, timedelta as td
-            JST = timezone(td(hours=9))
+            JST = timezone(timedelta(hours=9))
             now = datetime.now(JST).replace(tzinfo=None)
             weekday_map = {0:'月',1:'火',2:'水',3:'木',4:'金',5:'土',6:'日'}
             today = weekday_map[now.weekday()]
@@ -128,7 +136,7 @@ def reminder_loop():
                 meal_dt = datetime.combine(now.date(), meal_time)
                 remind_dt = meal_dt - timedelta(minutes=remind_minutes)
                 diff = abs((now - remind_dt).total_seconds())
-                if diff < 60 and group_id:
+                if diff < 90 and group_id:
                     push_group(f'🍚 {meal_type}ごはんリマインド\n⏰ {meal_time.strftime("%H:%M")} まであと{remind_minutes}分')
 
             cur.execute('SELECT trash_type, weekdays, notify_time FROM trash_schedule')
@@ -136,7 +144,7 @@ def reminder_loop():
                 if today in weekdays:
                     notify_dt = datetime.combine(now.date(), notify_time)
                     diff = abs((now - notify_dt).total_seconds())
-                    if diff < 60:
+                    if diff < 90:
                         push_group(f'🗑️ 今日は{trash_type}の日です！忘れずに！')
 
             cur.execute('SELECT notify_time FROM bath_schedule LIMIT 1')
@@ -144,7 +152,7 @@ def reminder_loop():
             if row:
                 notify_dt = datetime.combine(now.date(), row[0])
                 diff = abs((now - notify_dt).total_seconds())
-                if diff < 60:
+                if diff < 90:
                     push_group('🛁 お風呂洗ってありますか？')
 
             cur.execute('SELECT notify_time FROM depart_check_schedule LIMIT 1')
@@ -152,7 +160,7 @@ def reminder_loop():
             if row:
                 notify_dt = datetime.combine(now.date(), row[0])
                 diff = abs((now - notify_dt).total_seconds())
-                if diff < 60:
+                if diff < 90:
                     push_group('🚃 今日の帰宅・出発時間を教えてください！\nまめBotの個別チャットで「出発・帰宅」から共有してください。')
 
             cur.execute('SELECT notify_time FROM dinner_schedule LIMIT 1')
@@ -297,6 +305,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
                 QuickReplyItem(action=PostbackAction(label='✅ 終わり', data='action=完了')),
             ])
         )
+
     elif action == '夕食回答':
         user_state[user_id] = {'action': 'dinner_response'}
         reply = TextMessage(text='今日の夕食はどうしますか？', quick_reply=QuickReply(items=[
@@ -313,19 +322,19 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         conn = get_db()
         cur = conn.cursor()
         cur.execute(
-            'INSERT INTO dinner_response (user_id, user_name, response, created_date) VALUES (%s, %s, %s, CURRENT_DATE) ON CONFLICT DO NOTHING',
+            '''INSERT INTO dinner_response (user_id, user_name, response, created_date)
+               VALUES (%s, %s, %s, CURRENT_DATE)
+               ON CONFLICT (user_id, created_date) DO UPDATE SET
+               response=EXCLUDED.response, user_name=EXCLUDED.user_name''',
             (user_id, name, value)
         )
-        # 今日の全回答を取得
         cur.execute('SELECT user_name, response FROM dinner_response WHERE created_date = CURRENT_DATE')
         responses = cur.fetchall()
-        # 未回答メンバーを取得
         cur.execute('SELECT display_name FROM members WHERE user_id NOT IN (SELECT user_id FROM dinner_response WHERE created_date = CURRENT_DATE)')
         unanswered = cur.fetchall()
         conn.commit()
         cur.close()
         conn.close()
-        
         summary = '🍚 夕食まとめ'
         for r_name, r_response in responses:
             summary += f'\n{r_name}: {r_response}'
@@ -364,7 +373,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         conn.close()
         user_state.pop(user_id, None)
         reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}に夕食確認を送ります！')
-        
+
     elif action == 'ごはんできた':
         push_group('🍚 ご飯ができました！みんな集まってください！')
         reply = TextMessage(text='家族グループに送りました！')
@@ -505,24 +514,21 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             name = MessagingApi(api_client).get_profile(user_id).display_name
         except:
             name = 'だれか'
-        
-        # 今日のデータを保存
         conn = get_db()
         cur = conn.cursor()
         cur.execute(
-            'INSERT INTO daily_schedule (user_name, depart_time, arrive_time, meal_status, created_date) VALUES (%s, %s, %s, %s, CURRENT_DATE)',
-            (name, depart, arrive, value)
+            '''INSERT INTO daily_schedule (user_id, user_name, depart_time, arrive_time, meal_status, created_date)
+               VALUES (%s, %s, %s, %s, %s, CURRENT_DATE)
+               ON CONFLICT (user_id, created_date) DO UPDATE SET
+               depart_time=EXCLUDED.depart_time, arrive_time=EXCLUDED.arrive_time, meal_status=EXCLUDED.meal_status''',
+            (user_id, name, depart, arrive, value)
         )
-        
-        # 今日の全員分を取得
         cur.execute('SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule WHERE created_date = CURRENT_DATE ORDER BY id')
         rows = cur.fetchall()
         conn.commit()
         cur.close()
         conn.close()
-        
         if len(rows) == 1:
-            # 1人目はシンプルに送信
             parts = [f'🚃 {name}']
             if depart:
                 parts.append(f'出発 {depart}')
@@ -531,7 +537,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             parts.append(value)
             push_group(' / '.join(parts))
         else:
-            # 2人目以降はまとめて送信
             summary = '🚃 本日の帰宅・出発まとめ'
             for r_name, r_depart, r_arrive, r_meal in rows:
                 line_parts = [r_name]
@@ -543,7 +548,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
                     line_parts.append(r_meal)
                 summary += f'\n{" / ".join(line_parts)}'
             push_group(summary)
-        
         user_state.pop(user_id, None)
         reply = TextMessage(text='家族グループに送りました☑️')
 
