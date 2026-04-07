@@ -72,9 +72,8 @@ def init_db():
             display_name TEXT
         )
     ''')
-    cur.execute('DROP TABLE IF EXISTS daily_schedule')
     cur.execute('''
-        CREATE TABLE daily_schedule (
+        CREATE TABLE IF NOT EXISTS daily_schedule (
             id SERIAL PRIMARY KEY,
             user_id TEXT,
             user_name TEXT,
