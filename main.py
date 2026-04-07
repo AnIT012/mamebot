@@ -459,6 +459,46 @@ def handle_message(event):
             ReplyMessageRequest(reply_token=event.reply_token, messages=[reply])
         )
 
+def setup_rich_menu():
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            
+            from linebot.v3.messaging.models import (
+                RichMenuRequest, RichMenuSize, RichMenuArea, RichMenuBounds
+            )
+            
+            rich_menu = RichMenuRequest(
+                size=RichMenuSize(width=2500, height=1686),
+                selected=True,
+                name='まめBotメニュー',
+                chat_bar_text='メニュー',
+                areas=[
+                    RichMenuArea(
+                        bounds=RichMenuBounds(x=0, y=0, width=1250, height=843),
+                        action=PostbackAction(label='ごはん', data='action=ごはん')
+                    ),
+                    RichMenuArea(
+                        bounds=RichMenuBounds(x=1250, y=0, width=1250, height=843),
+                        action=PostbackAction(label='出発・帰宅', data='action=出発・帰宅')
+                    ),
+                    RichMenuArea(
+                        bounds=RichMenuBounds(x=0, y=843, width=1250, height=843),
+                        action=PostbackAction(label='お風呂', data='action=お風呂')
+                    ),
+                    RichMenuArea(
+                        bounds=RichMenuBounds(x=1250, y=843, width=1250, height=843),
+                        action=PostbackAction(label='ゴミの日', data='action=ゴミの日')
+                    ),
+                ]
+            )
+            rich_menu_id = line_bot_api.create_rich_menu(rich_menu).rich_menu_id
+            print(f'Rich menu created: {rich_menu_id}')
+            return rich_menu_id
+    except Exception as e:
+        print(f'Rich menu setup error: {e}')
+        return None
+
 with app.app_context():
     init_db()
     t = threading.Thread(target=reminder_loop, daemon=True)
