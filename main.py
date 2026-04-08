@@ -10,7 +10,6 @@ import threading
 import time
 import requests as http_requests
 
-
 app = Flask(__name__)
 
 configuration = Configuration(access_token=os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
@@ -54,6 +53,12 @@ def init_db():
         )
     ''')
     cur.execute('''
+        CREATE TABLE IF NOT EXISTS dinner_schedule (
+            id SERIAL PRIMARY KEY,
+            notify_time TIME
+        )
+    ''')
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS groups (
             id SERIAL PRIMARY KEY,
             group_id TEXT UNIQUE,
@@ -83,27 +88,8 @@ def init_db():
             UNIQUE (user_id, created_date)
         )
     ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS dinner_schedule (
-            id SERIAL PRIMARY KEY,
-            notify_time TIME
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS dinner_response (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT,
-            user_name TEXT,
-            response TEXT,
-            created_date DATE DEFAULT CURRENT_DATE
-        )
-    ''')
     try:
         cur.execute('ALTER TABLE daily_schedule ADD CONSTRAINT unique_daily_user UNIQUE (user_id, created_date)')
-    except:
-        pass
-    try:
-        cur.execute('ALTER TABLE dinner_response ADD CONSTRAINT unique_dinner_user UNIQUE (user_id, created_date)')
     except:
         pass
     conn.commit()
@@ -197,7 +183,7 @@ def reminder_loop():
                 notify_dt = datetime.combine(now.date(), row[0])
                 diff = abs((now - notify_dt).total_seconds())
                 if diff < 90:
-                    push_members('🍚 今日の夕食はどうしますか？\nメニューの「ごはん」→「夕食回答」から教えてください😊')
+                    push_members('🍚 今日の夕食はどうしますか？\nメニューの「ごはん」→「ご飯どうする？」から教えてください😊')
 
             cur.close()
             conn.close()
@@ -267,17 +253,47 @@ def push_group(text):
                 json=data
             )
 
+def send_dinner_summary():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT user_name, meal_status FROM daily_schedule WHERE created_date = CURRENT_DATE ORDER BY id')
+    responses = cur.fetchall()
+    cur.execute('SELECT display_name FROM members WHERE user_id NOT IN (SELECT user_id FROM daily_schedule WHERE created_date = CURRENT_DATE AND meal_status IS NOT NULL)')
+    unanswered = cur.fetchall()
+    cur.close()
+    conn.close()
+    summary = '🍚 夕食まとめ'
+    for r_name, r_meal in responses:
+        if r_meal:
+            summary += f'\n{r_name}: {r_meal}'
+    for (u_name,) in unanswered:
+        summary += f'\n{u_name}: 未回答'
+    push_group(summary)
+
 def process_action(action, value, context, user_id, api_client, reply_token):
 
+    # ========== ごはん ==========
     if action == 'ごはん':
         user_state.pop(user_id, None)
+        reply = TextMessage(text='何をしますか？', quick_reply=QuickReply(items=[
+            QuickReplyItem(action=PostbackAction(label='🕐 時間を設定', data='action=ごはん時間設定')),
+            QuickReplyItem(action=PostbackAction(label='🍽️ ご飯どうする？', data='action=ご飯どうする')),
+            QuickReplyItem(action=PostbackAction(label='🔔 できました！', data='action=ごはんできた')),
+        ]))
+
+    elif action == 'ごはん時間設定':
         reply = TextMessage(text='どの時間帯を設定しますか？', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='🌅 朝', data='action=ごはん選択&value=朝')),
             QuickReplyItem(action=PostbackAction(label='☀️ 昼', data='action=ごはん選択&value=昼')),
             QuickReplyItem(action=PostbackAction(label='🌙 夜', data='action=ごはん選択&value=夜')),
-            QuickReplyItem(action=PostbackAction(label='🍽️ 夕食回答', data='action=夕食回答')),
-            QuickReplyItem(action=PostbackAction(label='⏰ 夕食確認を設定', data='action=夕食送信設定')),
-            QuickReplyItem(action=PostbackAction(label='🔔 できました！', data='action=ごはんできた')),
+        ]))
+
+    elif action == 'ご飯どうする':
+        reply = TextMessage(text='今日の夕食はどうしますか？', quick_reply=QuickReply(items=[
+            QuickReplyItem(action=PostbackAction(label='🏠 家で食べる', data='action=夕食登録&value=家で食べる🏠')),
+            QuickReplyItem(action=PostbackAction(label='🍴 外で食べる', data='action=夕食登録&value=外で食べる🍴')),
+            QuickReplyItem(action=PostbackAction(label='❓ 未定', data='action=夕食登録&value=未定❓')),
+            QuickReplyItem(action=PostbackAction(label='⏰ 確認時間を設定', data='action=夕食送信設定')),
         ]))
 
     elif action == 'ごはん選択':
@@ -335,14 +351,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             ])
         )
 
-    elif action == '夕食回答':
-        user_state[user_id] = {'action': 'dinner_response'}
-        reply = TextMessage(text='今日の夕食はどうしますか？', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='🏠 家で食べる', data='action=夕食登録&value=家で食べる🏠')),
-            QuickReplyItem(action=PostbackAction(label='🍴 外で食べる', data='action=夕食登録&value=外で食べる🍴')),
-            QuickReplyItem(action=PostbackAction(label='❓ 未定', data='action=夕食登録&value=未定❓')),
-        ]))
-
     elif action == '夕食登録':
         try:
             name = MessagingApi(api_client).get_profile(user_id).display_name
@@ -351,26 +359,16 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         conn = get_db()
         cur = conn.cursor()
         cur.execute(
-            '''INSERT INTO dinner_response (user_id, user_name, response, created_date)
+            '''INSERT INTO daily_schedule (user_id, user_name, meal_status, created_date)
                VALUES (%s, %s, %s, CURRENT_DATE)
                ON CONFLICT (user_id, created_date) DO UPDATE SET
-               response=EXCLUDED.response, user_name=EXCLUDED.user_name''',
+               meal_status=EXCLUDED.meal_status, user_name=EXCLUDED.user_name''',
             (user_id, name, value)
         )
-        cur.execute('SELECT user_name, response FROM dinner_response WHERE created_date = CURRENT_DATE')
-        responses = cur.fetchall()
-        cur.execute('SELECT display_name FROM members WHERE user_id NOT IN (SELECT user_id FROM dinner_response WHERE created_date = CURRENT_DATE)')
-        unanswered = cur.fetchall()
         conn.commit()
         cur.close()
         conn.close()
-        summary = '🍚 夕食まとめ'
-        for r_name, r_response in responses:
-            summary += f'\n{r_name}: {r_response}'
-        for (u_name,) in unanswered:
-            summary += f'\n{u_name}: 未回答'
-        push_group(summary)
-        user_state.pop(user_id, None)
+        send_dinner_summary()
         reply = TextMessage(text='回答を送りました！家族グループに一覧を送信しました☑️')
 
     elif action == '夕食送信設定':
@@ -407,6 +405,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         push_group('🍚 ご飯ができました！みんな集まってください！')
         reply = TextMessage(text='家族グループに送りました！')
 
+    # ========== お風呂 ==========
     elif action == 'お風呂':
         user_state.pop(user_id, None)
         try:
@@ -461,6 +460,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         user_state.pop(user_id, None)
         reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}にお風呂の確認を送ります！')
 
+    # ========== 出発・帰宅 ==========
     elif action == '出発・帰宅':
         user_state.pop(user_id, None)
         reply = TextMessage(text='共有しますか？確認しますか？', quick_reply=QuickReply(items=[
@@ -626,6 +626,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         user_state.pop(user_id, None)
         reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}に帰宅確認を送ります！')
 
+    # ========== ゴミの日 ==========
     elif action == 'ゴミの日':
         user_state.pop(user_id, None)
         conn = get_db()
@@ -757,7 +758,7 @@ def handle_message(event):
         elif text == '使い方':
             reply = TextMessage(text=
                 '📖 まめBot 使い方\n\n'
-                '🍚 ごはん\n朝・昼・夜のごはん時間を登録してリマインドを設定できます。ごはんができたら一斉通知も！夕食の予定も家族に共有できます。\n\n'
+                '🍚 ごはん\n朝・昼・夜のごはん時間を登録してリマインドを設定できます。夕食の予定を家族に共有したり、ごはんができたら一斉通知もできます。\n\n'
                 '🚃 出発・帰宅\n今日の出発・帰宅時間とご飯の有無を家族に共有できます。確認メッセージを全員に送ることもできます。\n\n'
                 '🛁 お風呂\nお風呂を洗ったか家族に報告・お願いができます。毎日決まった時間にお風呂確認を自動送信する設定も可能です。\n\n'
                 '🗑️ ゴミの日\nゴミの種類と収集曜日を登録すると毎朝7時に自動通知されます。\n\n'
