@@ -268,20 +268,17 @@ def push_group(text):
             )
 
 def send_dinner_summary():
-    group_ids = get_group_ids()
-    active_gid = group_ids[0] if group_ids else None
     conn = get_db()
     cur = conn.cursor()
     cur.execute('SELECT user_name, meal_status FROM daily_schedule WHERE created_date = CURRENT_DATE ORDER BY id')
     responses = cur.fetchall()
     cur.execute('''
         SELECT display_name FROM members
-        WHERE group_id = %s
-        AND user_id NOT IN (
+        WHERE user_id NOT IN (
             SELECT user_id FROM daily_schedule
             WHERE created_date = CURRENT_DATE AND meal_status IS NOT NULL
         )
-    ''', (active_gid,))
+    ''')
     unanswered = cur.fetchall()
     cur.close()
     conn.close()
