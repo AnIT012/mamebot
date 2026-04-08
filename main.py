@@ -69,8 +69,10 @@ def init_db():
         cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT FALSE')
     except:
         pass
+
+    cur.execute('DROP TABLE IF EXISTS members CASCADE')
     cur.execute('''
-        CREATE TABLE IF NOT EXISTS members (
+        CREATE TABLE members (
             id SERIAL PRIMARY KEY,
             user_id TEXT,
             display_name TEXT,
