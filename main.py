@@ -72,10 +72,18 @@ def init_db():
     cur.execute('''
         CREATE TABLE IF NOT EXISTS members (
             id SERIAL PRIMARY KEY,
-            user_id TEXT UNIQUE,
-            display_name TEXT
+            user_id TEXT,
+            display_name TEXT,
+            group_id TEXT,
+            UNIQUE (user_id, group_id)
         )
     ''')
+    try:
+        cur.execute('ALTER TABLE members ADD COLUMN IF NOT EXISTS group_id TEXT')
+        cur.execute('ALTER TABLE members DROP CONSTRAINT IF EXISTS members_user_id_key')
+        cur.execute('ALTER TABLE members ADD CONSTRAINT members_user_group_unique UNIQUE (user_id, group_id)')
+    except:
+        pass
     cur.execute('''
         CREATE TABLE IF NOT EXISTS daily_schedule (
             id SERIAL PRIMARY KEY,
@@ -116,9 +124,13 @@ def get_group_ids():
 
 def push_members(text):
     try:
+        group_ids = get_group_ids()
+        active_gid = group_ids[0] if group_ids else None
+        if not active_gid:
+            return
         conn = get_db()
         cur = conn.cursor()
-        cur.execute('SELECT user_id FROM members')
+        cur.execute('SELECT user_id FROM members WHERE group_id = %s', (active_gid,))
         member_ids = cur.fetchall()
         cur.close()
         conn.close()
@@ -254,11 +266,20 @@ def push_group(text):
             )
 
 def send_dinner_summary():
+    group_ids = get_group_ids()
+    active_gid = group_ids[0] if group_ids else None
     conn = get_db()
     cur = conn.cursor()
     cur.execute('SELECT user_name, meal_status FROM daily_schedule WHERE created_date = CURRENT_DATE ORDER BY id')
     responses = cur.fetchall()
-    cur.execute('SELECT display_name FROM members WHERE user_id NOT IN (SELECT user_id FROM daily_schedule WHERE created_date = CURRENT_DATE AND meal_status IS NOT NULL)')
+    cur.execute('''
+        SELECT display_name FROM members
+        WHERE group_id = %s
+        AND user_id NOT IN (
+            SELECT user_id FROM daily_schedule
+            WHERE created_date = CURRENT_DATE AND meal_status IS NOT NULL
+        )
+    ''', (active_gid,))
     unanswered = cur.fetchall()
     cur.close()
     conn.close()
@@ -272,7 +293,6 @@ def send_dinner_summary():
 
 def process_action(action, value, context, user_id, api_client, reply_token):
 
-    # ========== ごはん ==========
     if action == 'ごはん':
         user_state.pop(user_id, None)
         reply = TextMessage(text='何をしますか？', quick_reply=QuickReply(items=[
@@ -405,7 +425,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         push_group('🍚 ご飯ができました！みんな集まってください！')
         reply = TextMessage(text='家族グループに送りました！')
 
-    # ========== お風呂 ==========
     elif action == 'お風呂':
         user_state.pop(user_id, None)
         try:
@@ -460,7 +479,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         user_state.pop(user_id, None)
         reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}にお風呂の確認を送ります！')
 
-    # ========== 出発・帰宅 ==========
     elif action == '出発・帰宅':
         user_state.pop(user_id, None)
         reply = TextMessage(text='共有しますか？確認しますか？', quick_reply=QuickReply(items=[
@@ -588,9 +606,11 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == '帰宅確認今すぐ':
         push_members('🚃 帰宅・出発時間の確認です！\nメニューの「出発・帰宅」から時間を共有してください😊')
+        group_ids = get_group_ids()
+        active_gid = group_ids[0] if group_ids else None
         conn = get_db()
         cur = conn.cursor()
-        cur.execute('SELECT COUNT(*) FROM members')
+        cur.execute('SELECT COUNT(*) FROM members WHERE group_id = %s', (active_gid,))
         count = cur.fetchone()[0]
         cur.close()
         conn.close()
@@ -626,7 +646,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         user_state.pop(user_id, None)
         reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}に帰宅確認を送ります！')
 
-    # ========== ゴミの日 ==========
     elif action == 'ゴミの日':
         user_state.pop(user_id, None)
         conn = get_db()
@@ -737,6 +756,10 @@ def handle_message(event):
     text = event.message.text
     user_id = event.source.user_id
 
+    # グループからのメッセージは無視
+    if hasattr(event.source, 'group_id'):
+        return
+
     with ApiClient(configuration) as api_client:
         if user_id in user_state and user_state[user_id].get('action') == 'set_trash_type_custom':
             trash_type = text
@@ -778,12 +801,20 @@ def handle_follow(event):
         try:
             profile = line_bot_api.get_profile(user_id)
             name = profile.display_name
+            group_ids = get_group_ids()
+            active_gid = group_ids[0] if group_ids else None
             conn = get_db()
             cur = conn.cursor()
-            cur.execute(
-                'INSERT INTO members (user_id, display_name) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET display_name=%s',
-                (user_id, name, name)
-            )
+            if active_gid:
+                cur.execute(
+                    'INSERT INTO members (user_id, display_name, group_id) VALUES (%s, %s, %s) ON CONFLICT (user_id, group_id) DO UPDATE SET display_name=%s',
+                    (user_id, name, active_gid, name)
+                )
+            else:
+                cur.execute(
+                    'INSERT INTO members (user_id, display_name, group_id) VALUES (%s, %s, NULL) ON CONFLICT DO NOTHING',
+                    (user_id, name)
+                )
             conn.commit()
             cur.close()
             conn.close()
