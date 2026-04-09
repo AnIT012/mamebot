@@ -5,7 +5,8 @@ from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent, JoinEvent, FollowEvent, LeaveEvent
 import os
 import psycopg2
-from datetime import datetime, timedelta, timezone
+import random
+from datetime import datetime, timedelta, timezone, date
 import threading
 import time
 import requests as http_requests
@@ -15,6 +16,11 @@ app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 DATABASE_URL = os.environ.get('DATABASE_URL')
+
+JST = timezone(timedelta(hours=9))
+
+def get_jst_date():
+    return datetime.now(JST).date()
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
@@ -40,16 +46,20 @@ def init_db():
         CREATE TABLE IF NOT EXISTS groups (
             id SERIAL PRIMARY KEY,
             group_id TEXT UNIQUE,
-            active BOOLEAN DEFAULT FALSE
+            active BOOLEAN DEFAULT FALSE,
+            invite_code TEXT UNIQUE
         )
     ''')
     try:
         cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT FALSE')
     except:
-        pass
-    cur.execute('DROP TABLE IF EXISTS members CASCADE')
+        conn.rollback()
+    try:
+        cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS invite_code TEXT UNIQUE')
+    except:
+        conn.rollback()
     cur.execute('''
-        CREATE TABLE members (
+        CREATE TABLE IF NOT EXISTS members (
             id SERIAL PRIMARY KEY,
             user_id TEXT,
             display_name TEXT,
@@ -57,6 +67,18 @@ def init_db():
             UNIQUE (user_id, group_id)
         )
     ''')
+    try:
+        cur.execute('ALTER TABLE members ADD COLUMN IF NOT EXISTS group_id TEXT')
+    except:
+        conn.rollback()
+    try:
+        cur.execute('ALTER TABLE members DROP CONSTRAINT IF EXISTS members_user_id_key')
+    except:
+        conn.rollback()
+    try:
+        cur.execute('ALTER TABLE members ADD CONSTRAINT members_user_group_unique UNIQUE (user_id, group_id)')
+    except:
+        conn.rollback()
     cur.execute('''
         CREATE TABLE IF NOT EXISTS daily_schedule (
             id SERIAL PRIMARY KEY,
@@ -65,21 +87,21 @@ def init_db():
             depart_time TEXT,
             arrive_time TEXT,
             meal_status TEXT,
-            created_date DATE DEFAULT CURRENT_DATE,
+            created_date DATE,
             UNIQUE (user_id, created_date)
         )
     ''')
     cur.execute('''
         CREATE TABLE IF NOT EXISTS bath_done (
             id SERIAL PRIMARY KEY,
-            done_date DATE DEFAULT CURRENT_DATE,
+            done_date DATE,
             UNIQUE (done_date)
         )
     ''')
     try:
         cur.execute('ALTER TABLE daily_schedule ADD CONSTRAINT unique_daily_user UNIQUE (user_id, created_date)')
     except:
-        pass
+        conn.rollback()
     conn.commit()
     cur.close()
     conn.close()
@@ -102,10 +124,13 @@ def get_group_ids():
         fallback = os.environ.get('LINE_GROUP_ID')
         return [fallback] if fallback else []
 
+def get_active_gid():
+    ids = get_group_ids()
+    return ids[0] if ids else None
+
 def push_members(text):
     try:
-        group_ids = get_group_ids()
-        active_gid = group_ids[0] if group_ids else None
+        active_gid = get_active_gid()
         if not active_gid:
             return
         conn = get_db()
@@ -126,88 +151,6 @@ def push_members(text):
             )
     except Exception as e:
         print(f'Push members error: {e}')
-
-def reminder_loop():
-    while True:
-        try:
-            conn = get_db()
-            cur = conn.cursor()
-            JST = timezone(timedelta(hours=9))
-            now = datetime.now(JST).replace(tzinfo=None)
-            weekday_map = {0:'月',1:'火',2:'水',3:'木',4:'金',5:'土',6:'日'}
-            today = weekday_map[now.weekday()]
-            yesterday = weekday_map[(now.weekday() - 1) % 7]
-
-            # ゴミの日：前日21時と当日朝7時
-            cur.execute('SELECT trash_type, weekdays FROM trash_schedule')
-            for trash_type, weekdays in cur.fetchall():
-                # 当日朝7時
-                if today in weekdays:
-                    notify_dt = datetime.combine(now.date(), datetime.strptime('07:00', '%H:%M').time())
-                    diff = abs((now - notify_dt).total_seconds())
-                    if diff < 90:
-                        push_group(f'⏰ リマインド\n🗑️ 今日は{trash_type}の日です！忘れずに！')
-                # 前日21時
-                if yesterday in weekdays:
-                    notify_dt = datetime.combine(now.date(), datetime.strptime('21:00', '%H:%M').time())
-                    diff = abs((now - notify_dt).total_seconds())
-                    if diff < 90:
-                        push_group(f'⏰ リマインド\n🗑️ 明日は{trash_type}の日です！準備を忘れずに！')
-
-            # お風呂：設定時間にまだ洗われてなかったら通知
-            cur.execute('SELECT notify_time FROM bath_schedule LIMIT 1')
-            row = cur.fetchone()
-            if row:
-                notify_dt = datetime.combine(now.date(), row[0])
-                diff = abs((now - notify_dt).total_seconds())
-                if diff < 90:
-                    cur2 = conn.cursor()
-                    cur2.execute('SELECT id FROM bath_done WHERE done_date = CURRENT_DATE')
-                    done = cur2.fetchone()
-                    cur2.close()
-                    if not done:
-                        push_group('⏰ リマインド\n🛁 まだお風呂が洗われていません！')
-
-            cur.close()
-            conn.close()
-        except Exception as e:
-            print(f'Reminder error: {e}')
-        time.sleep(60)
-
-user_state = {}
-
-def make_hour_qr(hours, context):
-    return QuickReply(items=[
-        QuickReplyItem(action=PostbackAction(label=f'{h}時', data=f'action=時&value={h}&context={context}'))
-        for h in hours
-    ])
-
-def make_minute_qr(context):
-    return QuickReply(items=[
-        QuickReplyItem(action=PostbackAction(label=f'{m:02d}分', data=f'action=分&value={m}&context={context}'))
-        for m in [0,5,10,15,20,25,30,35,40,45,50,55]
-    ])
-
-MORNING_HOURS = [6,7,8,9,10]
-LUNCH_HOURS = [11,12,13,14]
-EVENING_HOURS = [17,18,19,20,21,22]
-AM_HOURS = [6,7,8,9,10,11]
-PM_HOURS = [12,13,14,15,16,17,18,19,20,21,22,23]
-
-@app.route("/callback", methods=['POST'])
-def callback():
-    signature = request.headers['X-Line-Signature']
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-    return 'OK'
-
-def send_reply(api_client, reply_token, reply):
-    MessagingApi(api_client).reply_message(
-        ReplyMessageRequest(reply_token=reply_token, messages=[reply])
-    )
 
 def push_group(text):
     group_ids = get_group_ids()
@@ -237,17 +180,29 @@ def push_group(text):
             )
 
 def send_dinner_summary():
+    active_gid = get_active_gid()
+    today = get_jst_date()
     conn = get_db()
     cur = conn.cursor()
-    cur.execute('SELECT user_name, meal_status FROM daily_schedule WHERE created_date = CURRENT_DATE ORDER BY id')
+    cur.execute('SELECT user_name, meal_status FROM daily_schedule WHERE created_date = %s ORDER BY id', (today,))
     responses = cur.fetchall()
-    cur.execute('''
-        SELECT display_name FROM members
-        WHERE user_id NOT IN (
-            SELECT user_id FROM daily_schedule
-            WHERE created_date = CURRENT_DATE AND meal_status IS NOT NULL
-        )
-    ''')
+    if active_gid:
+        cur.execute('''
+            SELECT display_name FROM members
+            WHERE group_id = %s
+            AND user_id NOT IN (
+                SELECT user_id FROM daily_schedule
+                WHERE created_date = %s AND meal_status IS NOT NULL
+            )
+        ''', (active_gid, today))
+    else:
+        cur.execute('''
+            SELECT display_name FROM members
+            WHERE user_id NOT IN (
+                SELECT user_id FROM daily_schedule
+                WHERE created_date = %s AND meal_status IS NOT NULL
+            )
+        ''', (today,))
     unanswered = cur.fetchall()
     cur.close()
     conn.close()
@@ -259,7 +214,83 @@ def send_dinner_summary():
         summary += f'\n{u_name}: 未回答'
     push_group(summary)
 
+def reminder_loop():
+    while True:
+        try:
+            conn = get_db()
+            cur = conn.cursor()
+            now = datetime.now(JST).replace(tzinfo=None)
+            weekday_map = {0:'月',1:'火',2:'水',3:'木',4:'金',5:'土',6:'日'}
+            today = weekday_map[now.weekday()]
+            yesterday = weekday_map[(now.weekday() - 1) % 7]
+
+            cur.execute('SELECT trash_type, weekdays FROM trash_schedule')
+            for trash_type, weekdays in cur.fetchall():
+                if today in weekdays:
+                    notify_dt = datetime.combine(now.date(), datetime.strptime('07:00', '%H:%M').time())
+                    diff = abs((now - notify_dt).total_seconds())
+                    if diff < 90:
+                        push_group(f'⏰ リマインド\n🗑️ 今日は{trash_type}の日です！忘れずに！')
+                if yesterday in weekdays:
+                    notify_dt = datetime.combine(now.date(), datetime.strptime('21:00', '%H:%M').time())
+                    diff = abs((now - notify_dt).total_seconds())
+                    if diff < 90:
+                        push_group(f'⏰ リマインド\n🗑️ 明日は{trash_type}の日です！準備を忘れずに！')
+
+            cur.execute('SELECT notify_time FROM bath_schedule LIMIT 1')
+            row = cur.fetchone()
+            if row:
+                notify_dt = datetime.combine(now.date(), row[0])
+                diff = abs((now - notify_dt).total_seconds())
+                if diff < 90:
+                    today_date = get_jst_date()
+                    cur2 = conn.cursor()
+                    cur2.execute('SELECT id FROM bath_done WHERE done_date = %s', (today_date,))
+                    done = cur2.fetchone()
+                    cur2.close()
+                    if not done:
+                        push_group('⏰ リマインド\n🛁 まだお風呂が洗われていません！')
+
+            cur.close()
+            conn.close()
+        except Exception as e:
+            print(f'Reminder error: {e}')
+        time.sleep(60)
+
+user_state = {}
+
+def make_hour_qr(hours, context):
+    return QuickReply(items=[
+        QuickReplyItem(action=PostbackAction(label=f'{h}時', data=f'action=時&value={h}&context={context}'))
+        for h in hours
+    ])
+
+def make_minute_qr(context):
+    return QuickReply(items=[
+        QuickReplyItem(action=PostbackAction(label=f'{m:02d}分', data=f'action=分&value={m}&context={context}'))
+        for m in [0,5,10,15,20,25,30,35,40,45,50,55]
+    ])
+
+AM_HOURS = [6,7,8,9,10,11]
+PM_HOURS = [12,13,14,15,16,17,18,19,20,21,22,23]
+
+@app.route("/callback", methods=['POST'])
+def callback():
+    signature = request.headers['X-Line-Signature']
+    body = request.get_data(as_text=True)
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+    return 'OK'
+
+def send_reply(api_client, reply_token, reply):
+    MessagingApi(api_client).reply_message(
+        ReplyMessageRequest(reply_token=reply_token, messages=[reply])
+    )
+
 def process_action(action, value, context, user_id, api_client, reply_token):
+    today = get_jst_date()
 
     # ========== ごはん ==========
     if action == 'ごはん':
@@ -285,10 +316,10 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         cur = conn.cursor()
         cur.execute(
             '''INSERT INTO daily_schedule (user_id, user_name, meal_status, created_date)
-               VALUES (%s, %s, %s, CURRENT_DATE)
+               VALUES (%s, %s, %s, %s)
                ON CONFLICT (user_id, created_date) DO UPDATE SET
                meal_status=EXCLUDED.meal_status, user_name=EXCLUDED.user_name''',
-            (user_id, name, value)
+            (user_id, name, value, today)
         )
         conn.commit()
         cur.close()
@@ -312,19 +343,16 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         except:
             name = 'あなた'
         user_state[user_id] = {'name': name}
-
         conn = get_db()
         cur = conn.cursor()
         cur.execute('SELECT notify_time FROM bath_schedule LIMIT 1')
         row = cur.fetchone()
         cur.close()
         conn.close()
-
         if row:
             current_time = row[0].strftime('%H:%M')
             reply = TextMessage(text=f'お風呂の状況を教えてください！\n\n現在のお風呂未洗い通知時間: {current_time}', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='✅ 洗った', data='action=お風呂状況&value=洗いました🚿')),
-                QuickReplyItem(action=PostbackAction(label='❌ 洗ってない', data='action=お風呂状況&value=まだ洗っていません💦')),
                 QuickReplyItem(action=PostbackAction(label='🛁 洗って入れた', data='action=お風呂状況&value=洗ってお湯を入れました🛁')),
                 QuickReplyItem(action=PostbackAction(label='📢 お願いする', data='action=お風呂お願い')),
                 QuickReplyItem(action=PostbackAction(label='✏️ 通知時間を変更', data='action=お風呂時間変更確認')),
@@ -332,7 +360,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         else:
             reply = TextMessage(text='お風呂の状況を教えてください！', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='✅ 洗った', data='action=お風呂状況&value=洗いました🚿')),
-                QuickReplyItem(action=PostbackAction(label='❌ 洗ってない', data='action=お風呂状況&value=まだ洗っていません💦')),
                 QuickReplyItem(action=PostbackAction(label='🛁 洗って入れた', data='action=お風呂状況&value=洗ってお湯を入れました🛁')),
                 QuickReplyItem(action=PostbackAction(label='📢 お願いする', data='action=お風呂お願い')),
                 QuickReplyItem(action=PostbackAction(label='⏰ 通知時間を設定', data='action=お風呂時間設定')),
@@ -340,14 +367,12 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == 'お風呂状況':
         name = user_state.get(user_id, {}).get('name', 'だれか')
-        # 洗った・洗って入れたの場合はbath_doneに記録
-        if '洗いました' in value or '洗ってお湯' in value:
-            conn = get_db()
-            cur = conn.cursor()
-            cur.execute('INSERT INTO bath_done (done_date) VALUES (CURRENT_DATE) ON CONFLICT DO NOTHING')
-            conn.commit()
-            cur.close()
-            conn.close()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('INSERT INTO bath_done (done_date) VALUES (%s) ON CONFLICT DO NOTHING', (today,))
+        conn.commit()
+        cur.close()
+        conn.close()
         push_group(f'🛁 {name}がお風呂を{value}')
         user_state.pop(user_id, None)
         reply = TextMessage(text='家族グループに送りました☑️')
@@ -381,31 +406,52 @@ def process_action(action, value, context, user_id, api_client, reply_token):
     elif action == '分' and context == 'bath':
         hour = user_state[user_id].get('hour')
         minute = int(value)
+        notify_time = f'{hour:02d}:{minute:02d}'
+        try:
+            name = MessagingApi(api_client).get_profile(user_id).display_name
+        except:
+            name = 'だれか'
         conn = get_db()
         cur = conn.cursor()
         cur.execute('DELETE FROM bath_schedule')
-        cur.execute('INSERT INTO bath_schedule (notify_time) VALUES (%s)', (f'{hour:02d}:{minute:02d}',))
+        cur.execute('INSERT INTO bath_schedule (notify_time) VALUES (%s)', (notify_time,))
         conn.commit()
         cur.close()
         conn.close()
+        push_group(f'⚙️ 設定が更新されました\n🛁 お風呂未洗い通知時間: {notify_time}\n（{name}が設定）')
         user_state.pop(user_id, None)
-        reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}にお風呂が洗われていなければ通知します！')
+        reply = TextMessage(text=f'✅ 毎日{notify_time}にお風呂が洗われていなければ通知します！')
 
     # ========== 出発・帰宅 ==========
     elif action == '出発・帰宅':
         user_state.pop(user_id, None)
-        reply = TextMessage(text='共有しますか？確認しますか？', quick_reply=QuickReply(items=[
+        reply = TextMessage(text='どうしますか？', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='📤 時間を共有する', data='action=帰宅共有開始')),
-            QuickReplyItem(action=PostbackAction(label='📥 時間を確認する', data='action=帰宅確認')),
+            QuickReplyItem(action=PostbackAction(label='📋 今日の状況を確認', data='action=帰宅確認')),
         ]))
 
     elif action == '帰宅共有開始':
-        user_state[user_id] = {'action': 'share_depart_ampm', 'depart': None, 'arrive': None}
-        reply = TextMessage(text='出発時間は？', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='午前', data='action=出発時間帯&value=am')),
-            QuickReplyItem(action=PostbackAction(label='午後', data='action=出発時間帯&value=pm')),
-            QuickReplyItem(action=PostbackAction(label='スキップ', data='action=出発スキップ')),
+        user_state[user_id] = {'action': 'share_type', 'depart': None, 'arrive': None}
+        reply = TextMessage(text='どの時間を共有しますか？', quick_reply=QuickReply(items=[
+            QuickReplyItem(action=PostbackAction(label='🚶 出発のみ', data='action=共有タイプ&value=depart')),
+            QuickReplyItem(action=PostbackAction(label='🏠 帰宅のみ', data='action=共有タイプ&value=arrive')),
+            QuickReplyItem(action=PostbackAction(label='両方', data='action=共有タイプ&value=both')),
         ]))
+
+    elif action == '共有タイプ':
+        user_state[user_id]['share_type'] = value
+        if value == 'arrive':
+            user_state[user_id]['action'] = 'share_arrive_ampm'
+            reply = TextMessage(text='帰宅は午前・午後どちら？', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='午前', data='action=帰宅時間帯&value=am')),
+                QuickReplyItem(action=PostbackAction(label='午後', data='action=帰宅時間帯&value=pm')),
+            ]))
+        else:
+            user_state[user_id]['action'] = 'share_depart_ampm'
+            reply = TextMessage(text='出発は午前・午後どちら？', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='午前', data='action=出発時間帯&value=am')),
+                QuickReplyItem(action=PostbackAction(label='午後', data='action=出発時間帯&value=pm')),
+            ]))
 
     elif action == '出発時間帯':
         hours = AM_HOURS if value == 'am' else PM_HOURS
@@ -414,28 +460,27 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == '時' and context == 'depart':
         user_state[user_id]['depart_hour'] = int(value)
-        user_state[user_id]['action'] = 'share_depart_minute'
         reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('depart'))
 
     elif action == '分' and context == 'depart':
         hour = user_state[user_id]['depart_hour']
         minute = int(value)
         user_state[user_id]['depart'] = f'{hour:02d}:{minute:02d}'
-        user_state[user_id]['action'] = 'share_arrive_ampm'
-        reply = TextMessage(text='帰宅時間は？', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='午前', data='action=帰宅時間帯&value=am')),
-            QuickReplyItem(action=PostbackAction(label='午後', data='action=帰宅時間帯&value=pm')),
-            QuickReplyItem(action=PostbackAction(label='スキップ', data='action=帰宅スキップ')),
-        ]))
-
-    elif action == '出発スキップ':
-        user_state[user_id]['depart'] = None
-        user_state[user_id]['action'] = 'share_arrive_ampm'
-        reply = TextMessage(text='帰宅時間は？', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='午前', data='action=帰宅時間帯&value=am')),
-            QuickReplyItem(action=PostbackAction(label='午後', data='action=帰宅時間帯&value=pm')),
-            QuickReplyItem(action=PostbackAction(label='スキップ', data='action=帰宅スキップ')),
-        ]))
+        share_type = user_state[user_id].get('share_type')
+        if share_type == 'both':
+            user_state[user_id]['action'] = 'share_arrive_ampm'
+            reply = TextMessage(text='帰宅時間は入力しますか？', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='午前', data='action=帰宅時間帯&value=am')),
+                QuickReplyItem(action=PostbackAction(label='午後', data='action=帰宅時間帯&value=pm')),
+                QuickReplyItem(action=PostbackAction(label='スキップ', data='action=帰宅スキップ')),
+            ]))
+        else:
+            user_state[user_id]['action'] = 'share_meal'
+            reply = TextMessage(text='ご飯はどうしますか？', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='🏠 家で食べる', data='action=ごはん状況&value=家で食べる🏠')),
+                QuickReplyItem(action=PostbackAction(label='🍴 外で食べる', data='action=ごはん状況&value=外で食べる🍴')),
+                QuickReplyItem(action=PostbackAction(label='❓ 未定', data='action=ごはん状況&value=未定❓')),
+            ]))
 
     elif action == '帰宅時間帯':
         hours = AM_HOURS if value == 'am' else PM_HOURS
@@ -444,7 +489,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == '時' and context == 'arrive':
         user_state[user_id]['arrive_hour'] = int(value)
-        user_state[user_id]['action'] = 'share_arrive_minute'
         reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('arrive'))
 
     elif action == '分' and context == 'arrive':
@@ -478,12 +522,12 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         cur = conn.cursor()
         cur.execute(
             '''INSERT INTO daily_schedule (user_id, user_name, depart_time, arrive_time, meal_status, created_date)
-               VALUES (%s, %s, %s, %s, %s, CURRENT_DATE)
+               VALUES (%s, %s, %s, %s, %s, %s)
                ON CONFLICT (user_id, created_date) DO UPDATE SET
                depart_time=EXCLUDED.depart_time, arrive_time=EXCLUDED.arrive_time, meal_status=EXCLUDED.meal_status''',
-            (user_id, name, depart, arrive, value)
+            (user_id, name, depart, arrive, value, today)
         )
-        cur.execute('SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule WHERE created_date = CURRENT_DATE ORDER BY id')
+        cur.execute('SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule WHERE created_date = %s ORDER BY id', (today,))
         rows = cur.fetchall()
         conn.commit()
         cur.close()
@@ -512,21 +556,44 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         reply = TextMessage(text='家族グループに送りました☑️')
 
     elif action == '帰宅確認':
-        reply = TextMessage(text='どうしますか？', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='📤 今すぐ送信', data='action=帰宅確認今すぐ')),
-        ]))
+        active_gid = get_active_gid()
+        today = get_jst_date()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule WHERE created_date = %s ORDER BY id', (today,))
+        answered = cur.fetchall()
+        if active_gid:
+            cur.execute('SELECT display_name FROM members WHERE group_id = %s AND user_id NOT IN (SELECT user_id FROM daily_schedule WHERE created_date = %s)', (active_gid, today))
+        else:
+            cur.execute('SELECT display_name FROM members WHERE user_id NOT IN (SELECT user_id FROM daily_schedule WHERE created_date = %s)', (today,))
+        unanswered = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        status_text = f'📋 今日の状況（{today.month}/{today.day}）'
+        for r_name, r_depart, r_arrive, r_meal in answered:
+            line_parts = [r_name]
+            if r_depart:
+                line_parts.append(f'出発 {r_depart}')
+            if r_arrive:
+                line_parts.append(f'帰宅 {r_arrive}')
+            if r_meal:
+                line_parts.append(r_meal)
+            status_text += f'\n{" / ".join(line_parts)}'
+        for (u_name,) in unanswered:
+            status_text += f'\n{u_name}: 未回答'
+
+        if unanswered:
+            reply = TextMessage(text=status_text, quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='📣 全員に入力を促す', data='action=帰宅確認今すぐ')),
+            ]))
+        else:
+            reply = TextMessage(text=status_text)
 
     elif action == '帰宅確認今すぐ':
         push_members('🚃 帰宅・出発時間の確認です！\nメニューの「出発・帰宅」から時間を共有してください😊')
-        group_ids = get_group_ids()
-        active_gid = group_ids[0] if group_ids else None
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT COUNT(*) FROM members WHERE group_id = %s', (active_gid,))
-        count = cur.fetchone()[0]
-        cur.close()
-        conn.close()
-        reply = TextMessage(text=f'全員({count}人)に確認メッセージを送りました☑️')
+        push_group('📣 帰宅・出発時間の入力を全員にお願いしました！')
+        reply = TextMessage(text='グループと全員の個別チャットに送りました☑️')
 
     # ========== ゴミの日 ==========
     elif action == 'ゴミの日':
@@ -583,6 +650,11 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         conn.commit()
         cur.close()
         conn.close()
+        try:
+            name = MessagingApi(api_client).get_profile(user_id).display_name
+        except:
+            name = 'だれか'
+        push_group(f'⚙️ 設定が更新されました\n🗑️ {value}のスケジュールを削除しました\n（{name}が操作）')
         reply = TextMessage(text=f'✅ {value}のスケジュールを削除しました。')
 
     elif action == 'ゴミ登録':
@@ -637,6 +709,10 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         if user_id in user_state and user_state[user_id].get('action') == 'set_trash_days':
             trash_type = user_state[user_id]['trash_type']
             days = user_state[user_id].get('days', '')
+            try:
+                name = MessagingApi(api_client).get_profile(user_id).display_name
+            except:
+                name = 'だれか'
             conn = get_db()
             cur = conn.cursor()
             cur.execute('DELETE FROM trash_schedule WHERE trash_type=%s', (trash_type,))
@@ -644,6 +720,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             conn.commit()
             cur.close()
             conn.close()
+            push_group(f'⚙️ 設定が更新されました\n🗑️ {trash_type}: {days}曜日\n（{name}が設定）')
             user_state.pop(user_id, None)
             reply = TextMessage(text=f'✅ {trash_type}を{days}曜日に登録しました！\n前日21時と当日朝7時に通知します🗑️', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='➕ 続けて登録', data='action=ゴミ登録')),
@@ -702,7 +779,7 @@ def handle_message(event):
             reply = TextMessage(text=
                 '📖 まめBot 使い方\n\n'
                 '🍚 ごはん\n夕食の予定を家族に共有したり、ごはんができたら一斉通知もできます。\n\n'
-                '🚃 出発・帰宅\n今日の出発・帰宅時間とご飯の有無を家族に共有できます。確認メッセージを全員に送ることもできます。\n\n'
+                '🚃 出発・帰宅\n今日の出発・帰宅時間とご飯の有無を家族に共有できます。今日の状況確認や全員への入力依頼もできます。\n\n'
                 '🛁 お風呂\nお風呂を洗ったか家族に報告・お願いができます。設定した時間までに洗われていなければ自動通知します。\n\n'
                 '🗑️ ゴミの日\nゴミの種類と収集曜日を登録すると前日21時と当日朝7時に自動通知されます。\n\n'
                 '💡 設定した内容はすべて家族グループに通知されます。'
@@ -710,7 +787,34 @@ def handle_message(event):
             send_reply(api_client, event.reply_token, reply)
 
         else:
-            send_reply(api_client, event.reply_token, TextMessage(text='メニューから選んでください。'))
+            # 6桁登録コードの処理
+            if text.isdigit() and len(text) == 6:
+                conn = get_db()
+                cur = conn.cursor()
+                cur.execute('SELECT group_id FROM groups WHERE invite_code = %s AND active = TRUE', (text,))
+                row = cur.fetchone()
+                if row:
+                    group_id = row[0]
+                    try:
+                        profile = MessagingApi(api_client).get_profile(user_id)
+                        name = profile.display_name
+                    except:
+                        name = 'だれか'
+                    cur.execute(
+                        'INSERT INTO members (user_id, display_name, group_id) VALUES (%s, %s, %s) ON CONFLICT (user_id, group_id) DO UPDATE SET display_name=%s',
+                        (user_id, name, group_id, name)
+                    )
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    reply = TextMessage(text=f'✅ 登録完了！グループと紐付けました😊\nメニューから各機能を使えます！')
+                else:
+                    cur.close()
+                    conn.close()
+                    reply = TextMessage(text='コードが見つかりませんでした。グループに表示されたコードを確認してください。')
+                send_reply(api_client, event.reply_token, reply)
+            else:
+                send_reply(api_client, event.reply_token, TextMessage(text='メニューから選んでください。\nグループの登録コード（6桁）をお持ちの方はそのまま入力してください。'))
 
 
 @handler.add(FollowEvent)
@@ -721,26 +825,9 @@ def handle_follow(event):
         try:
             profile = line_bot_api.get_profile(user_id)
             name = profile.display_name
-            group_ids = get_group_ids()
-            active_gid = group_ids[0] if group_ids else None
-            conn = get_db()
-            cur = conn.cursor()
-            if active_gid:
-                cur.execute(
-                    'INSERT INTO members (user_id, display_name, group_id) VALUES (%s, %s, %s) ON CONFLICT (user_id, group_id) DO UPDATE SET display_name=%s',
-                    (user_id, name, active_gid, name)
-                )
-            else:
-                cur.execute(
-                    'INSERT INTO members (user_id, display_name, group_id) VALUES (%s, %s, NULL) ON CONFLICT DO NOTHING',
-                    (user_id, name)
-                )
-            conn.commit()
-            cur.close()
-            conn.close()
-            print(f'Member registered: {name}')
+            print(f'Member followed: {name}')
         except Exception as e:
-            print(f'Member registration error: {e}')
+            print(f'Follow error: {e}')
 
         line_bot_api.reply_message(
             ReplyMessageRequest(
@@ -748,8 +835,9 @@ def handle_follow(event):
                 messages=[TextMessage(text=
                     'こんにちは！まめBotです🫘\n\n'
                     '家族の日常をもっとスムーズにするお手伝いをします。\n\n'
-                    '下のメニューから使ってみてください！\n'
-                    '使い方を見るには「使い方」と送ってください📖'
+                    'グループにまめBotを招待すると登録コード（6桁）が発行されます。\n'
+                    'そのコードをここに入力するとグループと紐付けられます！\n\n'
+                    '下のメニューから使ってみてください😊'
                 )]
             )
         )
@@ -758,35 +846,38 @@ def handle_follow(event):
 @handler.add(JoinEvent)
 def handle_join(event):
     group_id = event.source.group_id
+    invite_code = str(random.randint(100000, 999999))
     try:
         conn = get_db()
         cur = conn.cursor()
         cur.execute('UPDATE groups SET active = FALSE')
-        cur.execute('INSERT INTO groups (group_id, active) VALUES (%s, TRUE) ON CONFLICT (group_id) DO UPDATE SET active = TRUE', (group_id,))
+        cur.execute(
+            'INSERT INTO groups (group_id, active, invite_code) VALUES (%s, TRUE, %s) ON CONFLICT (group_id) DO UPDATE SET active = TRUE, invite_code = %s',
+            (group_id, invite_code, invite_code)
+        )
+        # 既存のNULLメンバーを新グループに紐付け
+        cur.execute('UPDATE members SET group_id = %s WHERE group_id IS NULL', (group_id,))
         conn.commit()
         cur.close()
         conn.close()
-        print(f'Group registered: {group_id}')
+        print(f'Group registered: {group_id}, code: {invite_code}')
     except Exception as e:
         print(f'Group registration error: {e}')
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
-        bot_info = line_bot_api.get_bot_info()
-        basic_id = bot_info.basic_id.lstrip('@')
-        friend_url = f'https://line.me/R/ti/p/@{basic_id}'
         line_bot_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(text=
                     'まめBotがグループに参加しました🫘\n\n'
                     '家族の日常をもっとスムーズにするお手伝いをします。\n\n'
-                    '【手順】\n'
-                    '① 下のリンクからまめBotを個別で友達追加\n'
-                    '② 個別チャットのメニューから操作\n'
-                    '③ 設定内容がこのグループに届きます\n\n'
-                    '友達追加はこちら↓\n'
-                    f'{friend_url}'
+                    '【登録手順】\n'
+                    '① まめBotを個別で友達追加\n'
+                    '② 個別チャットで下の登録コードを入力\n'
+                    '③ 登録完了！メニューから使えます\n\n'
+                    f'登録コード: 【{invite_code}】\n\n'
+                    '※コードはグループにまめBotを追加し直すと変わります'
                 )]
             )
         )
