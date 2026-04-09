@@ -198,13 +198,11 @@ def push_group(text):
 
 def send_dinner_summary():
     active_gid = get_active_gid()
-    print(f'DEBUG active_gid: {active_gid}')
     today = get_jst_date()
     conn = get_db()
     cur = conn.cursor()
     cur.execute('SELECT user_name, meal_status FROM daily_schedule WHERE created_date = %s ORDER BY id', (today,))
     responses = cur.fetchall()
-    print(f'DEBUG responses: {responses}')
     if active_gid:
         cur.execute('''
             SELECT display_name FROM members
@@ -223,7 +221,6 @@ def send_dinner_summary():
             )
         ''', (today,))
     unanswered = cur.fetchall()
-    print(f'DEBUG unanswered: {unanswered}')
     cur.close()
     conn.close()
     summary = '🍚 夕食まとめ'
