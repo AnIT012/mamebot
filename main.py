@@ -23,16 +23,6 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
     cur.execute('''
-        CREATE TABLE IF NOT EXISTS meal_times (
-            id SERIAL PRIMARY KEY,
-            meal_type VARCHAR(10),
-            meal_time TIME,
-            remind_minutes INTEGER DEFAULT 120,
-            group_id TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    ''')
-    cur.execute('''
         CREATE TABLE IF NOT EXISTS trash_schedule (
             id SERIAL PRIMARY KEY,
             trash_type VARCHAR(50),
@@ -42,18 +32,6 @@ def init_db():
     ''')
     cur.execute('''
         CREATE TABLE IF NOT EXISTS bath_schedule (
-            id SERIAL PRIMARY KEY,
-            notify_time TIME
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS depart_check_schedule (
-            id SERIAL PRIMARY KEY,
-            notify_time TIME
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS dinner_schedule (
             id SERIAL PRIMARY KEY,
             notify_time TIME
         )
@@ -69,7 +47,6 @@ def init_db():
         cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT FALSE')
     except:
         pass
-
     cur.execute('DROP TABLE IF EXISTS members CASCADE')
     cur.execute('''
         CREATE TABLE members (
@@ -80,12 +57,6 @@ def init_db():
             UNIQUE (user_id, group_id)
         )
     ''')
-    try:
-        cur.execute('ALTER TABLE members ADD COLUMN IF NOT EXISTS group_id TEXT')
-        cur.execute('ALTER TABLE members DROP CONSTRAINT IF EXISTS members_user_id_key')
-        cur.execute('ALTER TABLE members ADD CONSTRAINT members_user_group_unique UNIQUE (user_id, group_id)')
-    except:
-        pass
     cur.execute('''
         CREATE TABLE IF NOT EXISTS daily_schedule (
             id SERIAL PRIMARY KEY,
@@ -96,6 +67,13 @@ def init_db():
             meal_status TEXT,
             created_date DATE DEFAULT CURRENT_DATE,
             UNIQUE (user_id, created_date)
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS bath_done (
+            id SERIAL PRIMARY KEY,
+            done_date DATE DEFAULT CURRENT_DATE,
+            UNIQUE (done_date)
         )
     ''')
     try:
@@ -158,46 +136,37 @@ def reminder_loop():
             now = datetime.now(JST).replace(tzinfo=None)
             weekday_map = {0:'月',1:'火',2:'水',3:'木',4:'金',5:'土',6:'日'}
             today = weekday_map[now.weekday()]
+            yesterday = weekday_map[(now.weekday() - 1) % 7]
 
-            cur.execute('SELECT meal_type, meal_time, remind_minutes, group_id FROM meal_times')
-            for meal_type, meal_time, remind_minutes, group_id in cur.fetchall():
-                meal_dt = datetime.combine(now.date(), meal_time)
-                remind_dt = meal_dt - timedelta(minutes=remind_minutes)
-                diff = abs((now - remind_dt).total_seconds())
-                if diff < 90 and group_id:
-                    push_group(f'🍚 {meal_type}ごはんリマインド\n⏰ {meal_time.strftime("%H:%M")} まであと{remind_minutes}分')
-
-            cur.execute('SELECT trash_type, weekdays, notify_time FROM trash_schedule')
-            for trash_type, weekdays, notify_time in cur.fetchall():
+            # ゴミの日：前日21時と当日朝7時
+            cur.execute('SELECT trash_type, weekdays FROM trash_schedule')
+            for trash_type, weekdays in cur.fetchall():
+                # 当日朝7時
                 if today in weekdays:
-                    notify_dt = datetime.combine(now.date(), notify_time)
+                    notify_dt = datetime.combine(now.date(), datetime.strptime('07:00', '%H:%M').time())
                     diff = abs((now - notify_dt).total_seconds())
                     if diff < 90:
-                        push_group(f'🗑️ 今日は{trash_type}の日です！忘れずに！')
+                        push_group(f'⏰ リマインド\n🗑️ 今日は{trash_type}の日です！忘れずに！')
+                # 前日21時
+                if yesterday in weekdays:
+                    notify_dt = datetime.combine(now.date(), datetime.strptime('21:00', '%H:%M').time())
+                    diff = abs((now - notify_dt).total_seconds())
+                    if diff < 90:
+                        push_group(f'⏰ リマインド\n🗑️ 明日は{trash_type}の日です！準備を忘れずに！')
 
+            # お風呂：設定時間にまだ洗われてなかったら通知
             cur.execute('SELECT notify_time FROM bath_schedule LIMIT 1')
             row = cur.fetchone()
             if row:
                 notify_dt = datetime.combine(now.date(), row[0])
                 diff = abs((now - notify_dt).total_seconds())
                 if diff < 90:
-                    push_group('🛁 お風呂洗ってありますか？')
-
-            cur.execute('SELECT notify_time FROM depart_check_schedule LIMIT 1')
-            row = cur.fetchone()
-            if row:
-                notify_dt = datetime.combine(now.date(), row[0])
-                diff = abs((now - notify_dt).total_seconds())
-                if diff < 90:
-                    push_members('🚃 帰宅・出発時間の確認です！\nメニューの「出発・帰宅」から時間を共有してください😊')
-
-            cur.execute('SELECT notify_time FROM dinner_schedule LIMIT 1')
-            row = cur.fetchone()
-            if row:
-                notify_dt = datetime.combine(now.date(), row[0])
-                diff = abs((now - notify_dt).total_seconds())
-                if diff < 90:
-                    push_members('🍚 今日の夕食はどうしますか？\nメニューの「ごはん」→「ご飯どうする？」から教えてください😊')
+                    cur2 = conn.cursor()
+                    cur2.execute('SELECT id FROM bath_done WHERE done_date = CURRENT_DATE')
+                    done = cur2.fetchone()
+                    cur2.close()
+                    if not done:
+                        push_group('⏰ リマインド\n🛁 まだお風呂が洗われていません！')
 
             cur.close()
             conn.close()
@@ -292,19 +261,12 @@ def send_dinner_summary():
 
 def process_action(action, value, context, user_id, api_client, reply_token):
 
+    # ========== ごはん ==========
     if action == 'ごはん':
         user_state.pop(user_id, None)
         reply = TextMessage(text='何をしますか？', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='🕐 時間を設定', data='action=ごはん時間設定')),
             QuickReplyItem(action=PostbackAction(label='🍽️ ご飯どうする？', data='action=ご飯どうする')),
             QuickReplyItem(action=PostbackAction(label='🔔 できました！', data='action=ごはんできた')),
-        ]))
-
-    elif action == 'ごはん時間設定':
-        reply = TextMessage(text='どの時間帯を設定しますか？', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='🌅 朝', data='action=ごはん選択&value=朝')),
-            QuickReplyItem(action=PostbackAction(label='☀️ 昼', data='action=ごはん選択&value=昼')),
-            QuickReplyItem(action=PostbackAction(label='🌙 夜', data='action=ごはん選択&value=夜')),
         ]))
 
     elif action == 'ご飯どうする':
@@ -312,63 +274,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             QuickReplyItem(action=PostbackAction(label='🏠 家で食べる', data='action=夕食登録&value=家で食べる🏠')),
             QuickReplyItem(action=PostbackAction(label='🍴 外で食べる', data='action=夕食登録&value=外で食べる🍴')),
             QuickReplyItem(action=PostbackAction(label='❓ 未定', data='action=夕食登録&value=未定❓')),
-            QuickReplyItem(action=PostbackAction(label='⏰ 確認時間を設定', data='action=夕食送信設定')),
         ]))
-
-    elif action == 'ごはん選択':
-        meal_type = value
-        user_state[user_id] = {'action': 'set_meal_hour', 'meal_type': meal_type}
-        hours = MORNING_HOURS if meal_type == '朝' else LUNCH_HOURS if meal_type == '昼' else EVENING_HOURS
-        reply = TextMessage(text=f'{meal_type}ごはんは何時台ですか？', quick_reply=make_hour_qr(hours, 'meal'))
-
-    elif action == '時' and context == 'meal':
-        user_state[user_id]['hour'] = int(value)
-        user_state[user_id]['action'] = 'set_meal_minute'
-        reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('meal'))
-
-    elif action == '分' and context == 'meal':
-        hour = user_state[user_id]['hour']
-        minute = int(value)
-        meal_type = user_state[user_id]['meal_type']
-        user_state[user_id]['meal_time'] = f'{hour:02d}:{minute:02d}'
-        user_state[user_id]['action'] = 'set_remind_minutes'
-        reply = TextMessage(
-            text=f'{meal_type}ごはん {hour:02d}:{minute:02d} を設定しました！\n何分前にリマインドしますか？',
-            quick_reply=QuickReply(items=[
-                QuickReplyItem(action=PostbackAction(label='30分前', data='action=リマインド設定&value=30')),
-                QuickReplyItem(action=PostbackAction(label='1時間前', data='action=リマインド設定&value=60')),
-                QuickReplyItem(action=PostbackAction(label='2時間前（デフォルト）', data='action=リマインド設定&value=120')),
-                QuickReplyItem(action=PostbackAction(label='3時間前', data='action=リマインド設定&value=180')),
-            ])
-        )
-
-    elif action == 'リマインド設定':
-        remind_minutes = int(value)
-        meal_type = user_state[user_id]['meal_type']
-        meal_time = user_state[user_id]['meal_time']
-        group_ids = get_group_ids()
-        gid = group_ids[0] if group_ids else ''
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('DELETE FROM meal_times WHERE meal_type=%s', (meal_type,))
-        cur.execute(
-            'INSERT INTO meal_times (meal_type, meal_time, remind_minutes, group_id) VALUES (%s, %s, %s, %s)',
-            (meal_type, meal_time, remind_minutes, gid)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-        push_group(f'🍚 {meal_type}ごはんの予定\n⏰ {meal_time}')
-        user_state.pop(user_id, None)
-        reply = TextMessage(
-            text=f'✅ 登録完了！{meal_time}の{remind_minutes}分前にリマインドします。\nグループに通知しました！',
-            quick_reply=QuickReply(items=[
-                QuickReplyItem(action=PostbackAction(label='🌅 朝も設定', data='action=ごはん選択&value=朝')),
-                QuickReplyItem(action=PostbackAction(label='☀️ 昼も設定', data='action=ごはん選択&value=昼')),
-                QuickReplyItem(action=PostbackAction(label='🌙 夜も設定', data='action=ごはん選択&value=夜')),
-                QuickReplyItem(action=PostbackAction(label='✅ 終わり', data='action=完了')),
-            ])
-        )
 
     elif action == '夕食登録':
         try:
@@ -390,40 +296,15 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         send_dinner_summary()
         reply = TextMessage(text='回答を送りました！家族グループに一覧を送信しました☑️')
 
-    elif action == '夕食送信設定':
-        user_state[user_id] = {'action': 'set_dinner_ampm'}
-        reply = TextMessage(text='何時に送信しますか？', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='午前', data='action=夕食時間帯&value=am')),
-            QuickReplyItem(action=PostbackAction(label='午後', data='action=夕食時間帯&value=pm')),
-        ]))
-
-    elif action == '夕食時間帯':
-        hours = AM_HOURS if value == 'am' else PM_HOURS
-        user_state[user_id]['action'] = 'set_dinner_hour'
-        reply = TextMessage(text='何時ですか？', quick_reply=make_hour_qr(hours, 'dinner'))
-
-    elif action == '時' and context == 'dinner':
-        user_state[user_id]['hour'] = int(value)
-        user_state[user_id]['action'] = 'set_dinner_minute'
-        reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('dinner'))
-
-    elif action == '分' and context == 'dinner':
-        hour = user_state[user_id].get('hour')
-        minute = int(value)
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('DELETE FROM dinner_schedule')
-        cur.execute('INSERT INTO dinner_schedule (notify_time) VALUES (%s)', (f'{hour:02d}:{minute:02d}',))
-        conn.commit()
-        cur.close()
-        conn.close()
-        user_state.pop(user_id, None)
-        reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}に夕食確認を送ります！')
-
     elif action == 'ごはんできた':
-        push_group('🍚 ご飯ができました！みんな集まってください！')
+        try:
+            name = MessagingApi(api_client).get_profile(user_id).display_name
+        except:
+            name = 'だれか'
+        push_group(f'🍚 {name}がご飯を作りました！みんな集まってください！')
         reply = TextMessage(text='家族グループに送りました！')
 
+    # ========== お風呂 ==========
     elif action == 'お風呂':
         user_state.pop(user_id, None)
         try:
@@ -431,16 +312,42 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         except:
             name = 'あなた'
         user_state[user_id] = {'name': name}
-        reply = TextMessage(text='お風呂の状況を教えてください！', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='✅ 洗った', data='action=お風呂状況&value=洗いました🚿')),
-            QuickReplyItem(action=PostbackAction(label='❌ 洗ってない', data='action=お風呂状況&value=まだ洗っていません💦')),
-            QuickReplyItem(action=PostbackAction(label='🛁 洗って入れた', data='action=お風呂状況&value=洗ってお湯を入れました🛁')),
-            QuickReplyItem(action=PostbackAction(label='📢 お願いする', data='action=お風呂お願い')),
-            QuickReplyItem(action=PostbackAction(label='⏰ リマインド時間を設定', data='action=お風呂時間設定')),
-        ]))
+
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT notify_time FROM bath_schedule LIMIT 1')
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if row:
+            current_time = row[0].strftime('%H:%M')
+            reply = TextMessage(text=f'お風呂の状況を教えてください！\n\n現在のお風呂未洗い通知時間: {current_time}', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='✅ 洗った', data='action=お風呂状況&value=洗いました🚿')),
+                QuickReplyItem(action=PostbackAction(label='❌ 洗ってない', data='action=お風呂状況&value=まだ洗っていません💦')),
+                QuickReplyItem(action=PostbackAction(label='🛁 洗って入れた', data='action=お風呂状況&value=洗ってお湯を入れました🛁')),
+                QuickReplyItem(action=PostbackAction(label='📢 お願いする', data='action=お風呂お願い')),
+                QuickReplyItem(action=PostbackAction(label='✏️ 通知時間を変更', data='action=お風呂時間変更確認')),
+            ]))
+        else:
+            reply = TextMessage(text='お風呂の状況を教えてください！', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='✅ 洗った', data='action=お風呂状況&value=洗いました🚿')),
+                QuickReplyItem(action=PostbackAction(label='❌ 洗ってない', data='action=お風呂状況&value=まだ洗っていません💦')),
+                QuickReplyItem(action=PostbackAction(label='🛁 洗って入れた', data='action=お風呂状況&value=洗ってお湯を入れました🛁')),
+                QuickReplyItem(action=PostbackAction(label='📢 お願いする', data='action=お風呂お願い')),
+                QuickReplyItem(action=PostbackAction(label='⏰ 通知時間を設定', data='action=お風呂時間設定')),
+            ]))
 
     elif action == 'お風呂状況':
         name = user_state.get(user_id, {}).get('name', 'だれか')
+        # 洗った・洗って入れたの場合はbath_doneに記録
+        if '洗いました' in value or '洗ってお湯' in value:
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute('INSERT INTO bath_done (done_date) VALUES (CURRENT_DATE) ON CONFLICT DO NOTHING')
+            conn.commit()
+            cur.close()
+            conn.close()
         push_group(f'🛁 {name}がお風呂を{value}')
         user_state.pop(user_id, None)
         reply = TextMessage(text='家族グループに送りました☑️')
@@ -449,9 +356,15 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         push_group('🛁 お風呂を洗ってください！')
         reply = TextMessage(text='家族グループにお願いしました☑️')
 
+    elif action == 'お風呂時間変更確認':
+        reply = TextMessage(text='通知時間を変更しますか？', quick_reply=QuickReply(items=[
+            QuickReplyItem(action=PostbackAction(label='✏️ 変更する', data='action=お風呂時間設定')),
+            QuickReplyItem(action=PostbackAction(label='キャンセル', data='action=お風呂')),
+        ]))
+
     elif action == 'お風呂時間設定':
         user_state[user_id] = {'action': 'set_bath_hour'}
-        reply = TextMessage(text='何時台に確認しますか？', quick_reply=QuickReply(items=[
+        reply = TextMessage(text='何時台に通知しますか？', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='午前', data='action=お風呂時間帯&value=am')),
             QuickReplyItem(action=PostbackAction(label='午後', data='action=お風呂時間帯&value=pm')),
         ]))
@@ -476,8 +389,9 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         cur.close()
         conn.close()
         user_state.pop(user_id, None)
-        reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}にお風呂の確認を送ります！')
+        reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}にお風呂が洗われていなければ通知します！')
 
+    # ========== 出発・帰宅 ==========
     elif action == '出発・帰宅':
         user_state.pop(user_id, None)
         reply = TextMessage(text='共有しますか？確認しますか？', quick_reply=QuickReply(items=[
@@ -600,7 +514,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
     elif action == '帰宅確認':
         reply = TextMessage(text='どうしますか？', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='📤 今すぐ送信', data='action=帰宅確認今すぐ')),
-            QuickReplyItem(action=PostbackAction(label='⏰ 毎日自動送信を設定', data='action=帰宅確認時間設定')),
         ]))
 
     elif action == '帰宅確認今すぐ':
@@ -615,36 +528,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         conn.close()
         reply = TextMessage(text=f'全員({count}人)に確認メッセージを送りました☑️')
 
-    elif action == '帰宅確認時間設定':
-        user_state[user_id] = {'action': 'set_depart_check_ampm'}
-        reply = TextMessage(text='何時に自動送信しますか？', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='午前', data='action=帰宅確認時間帯&value=am')),
-            QuickReplyItem(action=PostbackAction(label='午後', data='action=帰宅確認時間帯&value=pm')),
-        ]))
-
-    elif action == '帰宅確認時間帯':
-        hours = AM_HOURS if value == 'am' else PM_HOURS
-        user_state[user_id]['action'] = 'set_depart_check_hour'
-        reply = TextMessage(text='何時ですか？', quick_reply=make_hour_qr(hours, 'depart_check'))
-
-    elif action == '時' and context == 'depart_check':
-        user_state[user_id]['hour'] = int(value)
-        user_state[user_id]['action'] = 'set_depart_check_minute'
-        reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('depart_check'))
-
-    elif action == '分' and context == 'depart_check':
-        hour = user_state[user_id].get('hour')
-        minute = int(value)
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('DELETE FROM depart_check_schedule')
-        cur.execute('INSERT INTO depart_check_schedule (notify_time) VALUES (%s)', (f'{hour:02d}:{minute:02d}',))
-        conn.commit()
-        cur.close()
-        conn.close()
-        user_state.pop(user_id, None)
-        reply = TextMessage(text=f'✅ 毎日{hour:02d}:{minute:02d}に帰宅確認を送ります！')
-
+    # ========== ゴミの日 ==========
     elif action == 'ゴミの日':
         user_state.pop(user_id, None)
         conn = get_db()
@@ -655,13 +539,51 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         conn.close()
         if rows:
             schedule_text = '\n'.join([f'・{t}: {w}曜日' for t, w in rows])
-            reply = TextMessage(text=f'現在のゴミ出しスケジュール📅\n{schedule_text}', quick_reply=QuickReply(items=[
-                QuickReplyItem(action=PostbackAction(label='➕ 追加・変更', data='action=ゴミ登録')),
+            reply = TextMessage(text=f'現在のゴミ出しスケジュール📅\n{schedule_text}\n\n前日21時と当日朝7時に通知します。', quick_reply=QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(label='➕ 追加', data='action=ゴミ登録')),
+                QuickReplyItem(action=PostbackAction(label='✏️ 変更・削除', data='action=ゴミ変更選択')),
             ]))
         else:
             reply = TextMessage(text='ゴミ出しスケジュールが未設定です。', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='➕ 登録する', data='action=ゴミ登録')),
             ]))
+
+    elif action == 'ゴミ変更選択':
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT trash_type, weekdays FROM trash_schedule')
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        items = [
+            QuickReplyItem(action=PostbackAction(label=f'✏️ {t}', data=f'action=ゴミ変更&value={t}'))
+            for t, w in rows
+        ] + [
+            QuickReplyItem(action=PostbackAction(label=f'🗑️ {t}を削除', data=f'action=ゴミ削除&value={t}'))
+            for t, w in rows
+        ]
+        reply = TextMessage(text='変更・削除するゴミの種類を選んでください。', quick_reply=QuickReply(items=items[:13]))
+
+    elif action == 'ゴミ変更':
+        user_state[user_id] = {'action': 'set_trash_days', 'trash_type': value, 'days': ''}
+        reply = TextMessage(text=f'「{value}」の新しい収集曜日を選んでください。', quick_reply=QuickReply(items=[
+            QuickReplyItem(action=PostbackAction(label='月', data='action=ゴミ曜日&value=月')),
+            QuickReplyItem(action=PostbackAction(label='火', data='action=ゴミ曜日&value=火')),
+            QuickReplyItem(action=PostbackAction(label='水', data='action=ゴミ曜日&value=水')),
+            QuickReplyItem(action=PostbackAction(label='木', data='action=ゴミ曜日&value=木')),
+            QuickReplyItem(action=PostbackAction(label='金', data='action=ゴミ曜日&value=金')),
+            QuickReplyItem(action=PostbackAction(label='土', data='action=ゴミ曜日&value=土')),
+            QuickReplyItem(action=PostbackAction(label='日', data='action=ゴミ曜日&value=日')),
+        ]))
+
+    elif action == 'ゴミ削除':
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('DELETE FROM trash_schedule WHERE trash_type=%s', (value,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        reply = TextMessage(text=f'✅ {value}のスケジュールを削除しました。')
 
     elif action == 'ゴミ登録':
         user_state[user_id] = {'action': 'set_trash_days'}
@@ -723,7 +645,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             cur.close()
             conn.close()
             user_state.pop(user_id, None)
-            reply = TextMessage(text=f'✅ {trash_type}を{days}曜日に登録しました！\n毎朝7時に通知します🗑️', quick_reply=QuickReply(items=[
+            reply = TextMessage(text=f'✅ {trash_type}を{days}曜日に登録しました！\n前日21時と当日朝7時に通知します🗑️', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='➕ 続けて登録', data='action=ゴミ登録')),
             ]))
         else:
@@ -755,7 +677,6 @@ def handle_message(event):
     text = event.message.text
     user_id = event.source.user_id
 
-    # グループからのメッセージは無視
     if hasattr(event.source, 'group_id'):
         return
 
@@ -780,10 +701,10 @@ def handle_message(event):
         elif text == '使い方':
             reply = TextMessage(text=
                 '📖 まめBot 使い方\n\n'
-                '🍚 ごはん\n朝・昼・夜のごはん時間を登録してリマインドを設定できます。夕食の予定を家族に共有したり、ごはんができたら一斉通知もできます。\n\n'
+                '🍚 ごはん\n夕食の予定を家族に共有したり、ごはんができたら一斉通知もできます。\n\n'
                 '🚃 出発・帰宅\n今日の出発・帰宅時間とご飯の有無を家族に共有できます。確認メッセージを全員に送ることもできます。\n\n'
-                '🛁 お風呂\nお風呂を洗ったか家族に報告・お願いができます。毎日決まった時間にお風呂確認を自動送信する設定も可能です。\n\n'
-                '🗑️ ゴミの日\nゴミの種類と収集曜日を登録すると毎朝7時に自動通知されます。\n\n'
+                '🛁 お風呂\nお風呂を洗ったか家族に報告・お願いができます。設定した時間までに洗われていなければ自動通知します。\n\n'
+                '🗑️ ゴミの日\nゴミの種類と収集曜日を登録すると前日21時と当日朝7時に自動通知されます。\n\n'
                 '💡 設定した内容はすべて家族グループに通知されます。'
             )
             send_reply(api_client, event.reply_token, reply)
