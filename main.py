@@ -155,6 +155,7 @@ def get_user_group(user_id):
 
 def push_to_group(group_id, text):
     if not group_id:
+        print(f'push_to_group: group_id is None')
         return
     headers = {
         'Content-Type': 'application/json',
@@ -173,8 +174,9 @@ def push_to_group(group_id, text):
             }
         }]
     }
-    http_requests.post('https://api.line.me/v2/bot/message/push', headers=headers, json=data)
-
+    res = http_requests.post('https://api.line.me/v2/bot/message/push', headers=headers, json=data)
+    print(f'push_to_group: group_id={group_id}, status={res.status_code}, body={res.text}')
+    
 def push_members(text, group_id):
     try:
         conn = get_db()
