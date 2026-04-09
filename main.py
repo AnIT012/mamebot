@@ -257,7 +257,7 @@ def reminder_loop():
             cur.execute('SELECT notify_time FROM bath_schedule LIMIT 1')
             row = cur.fetchone()
             if row:
-                notify_dt = datetime.combine(now.date(), row)
+                notify_dt = datetime.combine(now.date(), row[0])
                 diff = abs((now - notify_dt).total_seconds())
                 if diff < 90:
                     today_date = get_jst_date()
