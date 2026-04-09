@@ -131,18 +131,21 @@ def init_db():
         conn.commit()
     except:
         conn.rollback()
+    try:
+        cur.execute('ALTER TABLE bath_schedule ADD CONSTRAINT bath_schedule_group_id_unique UNIQUE (group_id)')
+        conn.commit()
+    except:
+        conn.rollback()
 
     cur.close()
     conn.close()
 
-def get_db():
-    return psycopg2.connect(DATABASE_URL)
 
 def get_user_group(user_id):
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute('SELECT group_id FROM members WHERE user_id = %s LIMIT 1', (user_id,))
+        cur.execute('SELECT group_id FROM members WHERE user_id = %s AND group_id IS NOT NULL ORDER BY id DESC LIMIT 1', (user_id,))
         row = cur.fetchone()
         cur.close()
         conn.close()
