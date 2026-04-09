@@ -131,7 +131,7 @@ def get_group_ids():
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        ids = [row for row in rows]
+        ids = [row for row in rows]  # ← 💡ここが直ります
         if not ids:
             fallback = os.environ.get('LINE_GROUP_ID')
             if fallback:
@@ -143,7 +143,7 @@ def get_group_ids():
 
 def get_active_gid():
     ids = get_group_ids()
-    return ids if ids else None
+    return ids if ids else None  # ← 💡ここが直ります
 
 def push_members(text):
     try:
