@@ -155,7 +155,6 @@ def get_user_group(user_id):
 
 def push_to_group(group_id, text):
     if not group_id:
-        print(f'push_to_group: group_id is None')
         return
     headers = {
         'Content-Type': 'application/json',
@@ -175,8 +174,8 @@ def push_to_group(group_id, text):
         }]
     }
     res = http_requests.post('https://api.line.me/v2/bot/message/push', headers=headers, json=data)
-    print(f'push_to_group: group_id={group_id}, status={res.status_code}, body={res.text}')
-    
+    print(f'push_to_group: status={res.status_code}')
+
 def push_members(text, group_id):
     try:
         conn = get_db()
@@ -334,6 +333,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
     today = get_jst_date()
     user_group = get_user_group(user_id)
 
+    # ========== ごはん ==========
     if action == 'ごはん':
         user_state.pop(user_id, None)
         if not user_group:
@@ -370,7 +370,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         conn.close()
         if user_group:
             send_dinner_summary(user_group)
-        reply = TextMessage(text='回答を送りました！家族グループに一覧を送信しました☑️')
+        reply = TextMessage(text=f'以下の内容を家族グループに送りました☑️\n・夕食: {value}')
 
     elif action == 'ごはんできた':
         try:
@@ -379,8 +379,9 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             name = 'だれか'
         if user_group:
             push_to_group(user_group, f'🍚 {name}がご飯を作りました！みんな集まってください！')
-        reply = TextMessage(text='家族グループに送りました！')
+        reply = TextMessage(text='以下の内容を家族グループに送りました☑️\n・ごはんができました！')
 
+    # ========== お風呂 ==========
     elif action == 'お風呂':
         user_state.pop(user_id, None)
         if not user_group:
@@ -424,12 +425,12 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             conn.close()
             push_to_group(user_group, f'🛁 {name}がお風呂を{value}')
         user_state.pop(user_id, None)
-        reply = TextMessage(text='家族グループに送りました☑️')
+        reply = TextMessage(text=f'以下の内容を家族グループに送りました☑️\n・お風呂を{value}')
 
     elif action == 'お風呂お願い':
         if user_group:
             push_to_group(user_group, '🛁 お風呂を洗ってください！')
-        reply = TextMessage(text='家族グループにお願いしました☑️')
+        reply = TextMessage(text='以下の内容を家族グループに送りました☑️\n・お風呂をお願いしました')
 
     elif action == 'お風呂時間変更確認':
         reply = TextMessage(text='通知時間を変更しますか？', quick_reply=QuickReply(items=[
@@ -439,22 +440,29 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == 'お風呂時間設定':
         user_state[user_id] = {'action': 'set_bath_hour'}
-        reply = TextMessage(text='何時台に通知しますか？', quick_reply=QuickReply(items=[
+        reply = TextMessage(text='通知する時間帯を選んでください。', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='午前', data='action=お風呂時間帯&value=am')),
             QuickReplyItem(action=PostbackAction(label='午後', data='action=お風呂時間帯&value=pm')),
         ]))
 
     elif action == 'お風呂時間帯':
         hours = AM_HOURS if value == 'am' else PM_HOURS
+        if user_id not in user_state:
+            user_state[user_id] = {}
+        user_state[user_id]['action'] = 'set_bath_minute'
         reply = TextMessage(text='何時ですか？', quick_reply=make_hour_qr(hours, 'bath'))
 
     elif action == '時' and context == 'bath':
+        if user_id not in user_state:
+            user_state[user_id] = {}
         user_state[user_id]['hour'] = int(value)
-        user_state[user_id]['action'] = 'set_bath_minute'
-        reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('bath'))
+        reply = TextMessage(text='何分ですか？', quick_reply=make_minute_qr('bath'))
 
     elif action == '分' and context == 'bath':
-        hour = user_state[user_id].get('hour')
+        hour = user_state.get(user_id, {}).get('hour')
+        if hour is None:
+            send_reply(api_client, reply_token, TextMessage(text='お風呂メニューから最初からやり直してください。'))
+            return
         minute = int(value)
         notify_time = f'{hour:02d}:{minute:02d}'
         try:
@@ -470,8 +478,9 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             conn.close()
             push_to_group(user_group, f'⚙️ 設定が更新されました\n🛁 お風呂未洗い通知時間: {notify_time}\n（{name}が設定）')
         user_state.pop(user_id, None)
-        reply = TextMessage(text=f'✅ 毎日{notify_time}にお風呂が洗われていなければ通知します！')
+        reply = TextMessage(text=f'以下の設定を保存しました☑️\n・お風呂未洗い通知: {notify_time}')
 
+    # ========== 出発・帰宅 ==========
     elif action == '出発・帰宅':
         user_state.pop(user_id, None)
         if not user_group:
@@ -494,13 +503,13 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         user_state[user_id]['share_type'] = value
         if value == 'arrive':
             user_state[user_id]['action'] = 'share_arrive_ampm'
-            reply = TextMessage(text='帰宅は午前・午後どちら？', quick_reply=QuickReply(items=[
+            reply = TextMessage(text='帰宅の時間帯を選んでください。', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='午前', data='action=帰宅時間帯&value=am')),
                 QuickReplyItem(action=PostbackAction(label='午後', data='action=帰宅時間帯&value=pm')),
             ]))
         else:
             user_state[user_id]['action'] = 'share_depart_ampm'
-            reply = TextMessage(text='出発は午前・午後どちら？', quick_reply=QuickReply(items=[
+            reply = TextMessage(text='出発の時間帯を選んでください。', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='午前', data='action=出発時間帯&value=am')),
                 QuickReplyItem(action=PostbackAction(label='午後', data='action=出発時間帯&value=pm')),
             ]))
@@ -512,7 +521,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == '時' and context == 'depart':
         user_state[user_id]['depart_hour'] = int(value)
-        reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('depart'))
+        reply = TextMessage(quick_reply=make_minute_qr('depart'), text='何分ですか？')
 
     elif action == '分' and context == 'depart':
         hour = user_state[user_id]['depart_hour']
@@ -521,7 +530,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         share_type = user_state[user_id].get('share_type')
         if share_type == 'both':
             user_state[user_id]['action'] = 'share_arrive_ampm'
-            reply = TextMessage(text='帰宅時間は入力しますか？', quick_reply=QuickReply(items=[
+            reply = TextMessage(text='帰宅の時間帯を選んでください。', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='午前', data='action=帰宅時間帯&value=am')),
                 QuickReplyItem(action=PostbackAction(label='午後', data='action=帰宅時間帯&value=pm')),
                 QuickReplyItem(action=PostbackAction(label='スキップ', data='action=帰宅スキップ')),
@@ -541,7 +550,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == '時' and context == 'arrive':
         user_state[user_id]['arrive_hour'] = int(value)
-        reply = TextMessage(text=f'{value}時何分ですか？', quick_reply=make_minute_qr('arrive'))
+        reply = TextMessage(quick_reply=make_minute_qr('arrive'), text='何分ですか？')
 
     elif action == '分' and context == 'arrive':
         hour = user_state[user_id]['arrive_hour']
@@ -614,7 +623,13 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             if user_group:
                 push_to_group(user_group, summary)
         user_state.pop(user_id, None)
-        reply = TextMessage(text='家族グループに送りました☑️')
+        confirm_parts = []
+        if depart:
+            confirm_parts.append(f'・出発 {depart}')
+        if arrive:
+            confirm_parts.append(f'・帰宅 {arrive}')
+        confirm_parts.append(f'・ご飯 {value}')
+        reply = TextMessage(text='以下の内容を家族グループに送りました☑️\n' + '\n'.join(confirm_parts))
 
     elif action == '帰宅確認':
         conn = get_db()
@@ -663,6 +678,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             push_to_group(user_group, '📣 帰宅・出発時間の入力を全員にお願いしました！')
         reply = TextMessage(text='グループと全員の個別チャットに送りました☑️')
 
+    # ========== ゴミの日 ==========
     elif action == 'ゴミの日':
         user_state.pop(user_id, None)
         if not user_group:
@@ -730,7 +746,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             name = 'だれか'
         if user_group:
             push_to_group(user_group, f'⚙️ 設定が更新されました\n🗑️ {value}のスケジュールを削除しました\n（{name}が操作）')
-        reply = TextMessage(text=f'✅ {value}のスケジュールを削除しました。')
+        reply = TextMessage(text=f'以下の設定を保存しました☑️\n・{value}のスケジュールを削除しました')
 
     elif action == 'ゴミ登録':
         user_state[user_id] = {'action': 'set_trash_days'}
@@ -767,7 +783,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             if value not in current_days:
                 current_days += value
             user_state[user_id]['days'] = current_days
-            reply = TextMessage(text=f'選択中: {current_days}曜日\n他にもありますか？', quick_reply=QuickReply(items=[
+            reply = TextMessage(text=f'選択中: {current_days}曜日', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='月', data='action=ゴミ曜日&value=月')),
                 QuickReplyItem(action=PostbackAction(label='火', data='action=ゴミ曜日&value=火')),
                 QuickReplyItem(action=PostbackAction(label='水', data='action=ゴミ曜日&value=水')),
@@ -807,7 +823,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             if user_group:
                 push_to_group(user_group, f'⚙️ 設定が更新されました\n🗑️ {trash_type}: {days}曜日（{week_label}）\n（{name}が設定）')
             user_state.pop(user_id, None)
-            reply = TextMessage(text=f'✅ {trash_type}を{days}曜日（{week_label}）に登録しました！\n前日21時と当日朝7時に通知します🗑️', quick_reply=QuickReply(items=[
+            reply = TextMessage(text=f'以下の設定を保存しました☑️\n・{trash_type}: {days}曜日（{week_label}）\n前日21時と当日朝7時に通知します🗑️', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='➕ 続けて登録', data='action=ゴミ登録')),
             ]))
         else:
