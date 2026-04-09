@@ -131,7 +131,7 @@ def get_group_ids():
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        ids = [row for row in rows]  # ← 💡ここが直ります
+        ids = [row[0] for row in rows]
         if not ids:
             fallback = os.environ.get('LINE_GROUP_ID')
             if fallback:
@@ -143,7 +143,7 @@ def get_group_ids():
 
 def get_active_gid():
     ids = get_group_ids()
-    return ids if ids else None  # ← 💡ここが直ります
+    return ids[0] if ids else None
 
 def push_members(text):
     try:
@@ -333,9 +333,9 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         cur = conn.cursor()
         cur.execute(
             '''INSERT INTO daily_schedule (user_id, user_name, meal_status, created_date)
-               VALUES (%s, %s, %s, %s)
-               ON CONFLICT (user_id, created_date) DO UPDATE SET
-               meal_status=EXCLUDED.meal_status, user_name=EXCLUDED.user_name''',
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id, created_date) DO UPDATE SET
+                meal_status=EXCLUDED.meal_status, user_name=EXCLUDED.user_name''',
             (user_id, name, value, today)
         )
         conn.commit()
@@ -367,7 +367,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         cur.close()
         conn.close()
         if row:
-            current_time = row.strftime('%H:%M')
+            current_time = row[0].strftime('%H:%M')
             reply = TextMessage(text=f'お風呂の状況を教えてください！\n\n現在のお風呂未洗い通知時間: {current_time}', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='✅ 洗った', data='action=お風呂状況&value=洗いました🚿')),
                 QuickReplyItem(action=PostbackAction(label='🛁 洗って入れた', data='action=お風呂状況&value=洗ってお湯を入れました🛁')),
@@ -811,7 +811,7 @@ def handle_message(event):
                 cur.execute('SELECT group_id FROM groups WHERE invite_code = %s AND active = TRUE', (text,))
                 row = cur.fetchone()
                 if row:
-                    group_id = row
+                    group_id = row[0]
                     try:
                         profile = MessagingApi(api_client).get_profile(user_id)
                         name = profile.display_name
