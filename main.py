@@ -214,9 +214,26 @@ def send_dinner_summary():
                 WHERE created_date = %s AND meal_status IS NOT NULL
             )
         ''', (active_gid, today))
-    cur.execute_result = cur.fetchall()
-    print(f'DEBUG unanswered: {cur.execute_result}')
-
+    else:
+        cur.execute('''
+            SELECT display_name FROM members
+            WHERE user_id NOT IN (
+                SELECT user_id FROM daily_schedule
+                WHERE created_date = %s AND meal_status IS NOT NULL
+            )
+        ''', (today,))
+    unanswered = cur.fetchall()
+    print(f'DEBUG unanswered: {unanswered}')
+    cur.close()
+    conn.close()
+    summary = '🍚 夕食まとめ'
+    for r_name, r_meal in responses:
+        if r_meal:
+            summary += f'\n{r_name}: {r_meal}'
+    for (u_name,) in unanswered:
+        summary += f'\n{u_name}: 未回答'
+    push_group(summary)
+    
 def reminder_loop():
     while True:
         try:
