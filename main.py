@@ -13,6 +13,11 @@ import requests as http_requests
 
 app = Flask(__name__)
 
+# --- 🌟 Renderのヘルスチェック（404エラー回避）用 🌟 ---
+@app.route("/", methods=['GET', 'HEAD'])
+def health_check():
+    return "OK", 200
+
 configuration = Configuration(access_token=os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 DATABASE_URL = os.environ.get('DATABASE_URL')
