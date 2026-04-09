@@ -51,14 +51,17 @@ def init_db():
     cur.execute('''
         CREATE TABLE IF NOT EXISTS groups (
             id SERIAL PRIMARY KEY,
-            group_id TEXT UNIQUE
+            group_id TEXT UNIQUE,
+            invite_code TEXT UNIQUE
         )
     ''')
     cur.execute('''
         CREATE TABLE IF NOT EXISTS members (
             id SERIAL PRIMARY KEY,
             user_id TEXT,
-            display_name TEXT
+            display_name TEXT,
+            group_id TEXT,
+            UNIQUE (user_id, group_id)
         )
     ''')
     cur.execute('''
@@ -83,11 +86,6 @@ def init_db():
     ''')
     conn.commit()
 
-    try:
-        cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT FALSE')
-        conn.commit()
-    except:
-        conn.rollback()
     try:
         cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS invite_code TEXT UNIQUE')
         conn.commit()
@@ -119,7 +117,7 @@ def init_db():
     except:
         conn.rollback()
     try:
-        cur.execute('ALTER TABLE trash_schedule ADD COLUMN IF NOT EXISTS week_type TEXT DEFAULT \'every\'')
+        cur.execute("ALTER TABLE trash_schedule ADD COLUMN IF NOT EXISTS week_type TEXT DEFAULT 'every'")
         conn.commit()
     except:
         conn.rollback()
@@ -137,27 +135,8 @@ def init_db():
     cur.close()
     conn.close()
 
-def get_group_ids():
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT group_id FROM groups WHERE active = TRUE')
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        ids = [row[0] for row in rows]
-        if not ids:
-            fallback = os.environ.get('LINE_GROUP_ID')
-            if fallback:
-                ids = [fallback]
-        return ids
-    except:
-        fallback = os.environ.get('LINE_GROUP_ID')
-        return [fallback] if fallback else []
-
-def get_active_gid():
-    ids = get_group_ids()
-    return ids[0] if ids else None
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
 
 def get_user_group(user_id):
     try:
@@ -170,27 +149,6 @@ def get_user_group(user_id):
         return row[0] if row else None
     except:
         return None
-
-def push_members(text, group_id):
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT user_id FROM members WHERE group_id = %s', (group_id,))
-        member_ids = cur.fetchall()
-        cur.close()
-        conn.close()
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")}'
-        }
-        for (mid,) in member_ids:
-            http_requests.post(
-                'https://api.line.me/v2/bot/message/push',
-                headers=headers,
-                json={'to': mid, 'messages': [{'type': 'text', 'text': text}]}
-            )
-    except Exception as e:
-        print(f'Push members error: {e}')
 
 def push_to_group(group_id, text):
     if not group_id:
@@ -214,9 +172,26 @@ def push_to_group(group_id, text):
     }
     http_requests.post('https://api.line.me/v2/bot/message/push', headers=headers, json=data)
 
-def push_group(text):
-    for gid in get_group_ids():
-        push_to_group(gid, text)
+def push_members(text, group_id):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT user_id FROM members WHERE group_id = %s', (group_id,))
+        member_ids = cur.fetchall()
+        cur.close()
+        conn.close()
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")}'
+        }
+        for (mid,) in member_ids:
+            http_requests.post(
+                'https://api.line.me/v2/bot/message/push',
+                headers=headers,
+                json={'to': mid, 'messages': [{'type': 'text', 'text': text}]}
+            )
+    except Exception as e:
+        print(f'Push members error: {e}')
 
 def send_dinner_summary(group_id):
     today = get_jst_date()
@@ -268,7 +243,6 @@ def reminder_loop():
             for group_id, trash_type, weekdays, week_type in cur.fetchall():
                 if not group_id:
                     continue
-                # 当日朝7時
                 if today in weekdays:
                     should_notify = False
                     if week_type == 'every':
@@ -282,7 +256,6 @@ def reminder_loop():
                         diff = abs((now - notify_dt).total_seconds())
                         if diff < 90:
                             push_to_group(group_id, f'⏰ リマインド\n🗑️ 今日は{trash_type}の日です！忘れずに！')
-                # 前日21時
                 if yesterday in weekdays:
                     should_notify = False
                     if week_type == 'every':
@@ -349,12 +322,18 @@ def send_reply(api_client, reply_token, reply):
         ReplyMessageRequest(reply_token=reply_token, messages=[reply])
     )
 
+def not_registered_reply():
+    return TextMessage(text='グループへの登録が必要です。\nグループに表示された登録コード（6桁）をここに入力してください。')
+
 def process_action(action, value, context, user_id, api_client, reply_token):
     today = get_jst_date()
     user_group = get_user_group(user_id)
 
     if action == 'ごはん':
         user_state.pop(user_id, None)
+        if not user_group:
+            send_reply(api_client, reply_token, not_registered_reply())
+            return
         reply = TextMessage(text='何をしますか？', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='🍽️ ご飯どうする？', data='action=ご飯どうする')),
             QuickReplyItem(action=PostbackAction(label='🔔 できました！', data='action=ごはんできた')),
@@ -399,6 +378,9 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == 'お風呂':
         user_state.pop(user_id, None)
+        if not user_group:
+            send_reply(api_client, reply_token, not_registered_reply())
+            return
         try:
             name = MessagingApi(api_client).get_profile(user_id).display_name
         except:
@@ -487,6 +469,9 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == '出発・帰宅':
         user_state.pop(user_id, None)
+        if not user_group:
+            send_reply(api_client, reply_token, not_registered_reply())
+            return
         reply = TextMessage(text='どうしますか？', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='📤 時間を共有する', data='action=帰宅共有開始')),
             QuickReplyItem(action=PostbackAction(label='📋 今日の状況を確認', data='action=帰宅確認')),
@@ -648,7 +633,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         unanswered = cur.fetchall()
         cur.close()
         conn.close()
-
         status_text = f'📋 今日の状況（{today.month}/{today.day}）'
         for r_name, r_depart, r_arrive, r_meal in answered:
             line_parts = [r_name]
@@ -661,7 +645,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             status_text += f'\n{" / ".join(line_parts)}'
         for (u_name,) in unanswered:
             status_text += f'\n{u_name}: 未回答'
-
         if unanswered:
             reply = TextMessage(text=status_text, quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='📣 全員に入力を促す', data='action=帰宅確認今すぐ')),
@@ -677,6 +660,9 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == 'ゴミの日':
         user_state.pop(user_id, None)
+        if not user_group:
+            send_reply(api_client, reply_token, not_registered_reply())
+            return
         conn = get_db()
         cur = conn.cursor()
         cur.execute('SELECT trash_type, weekdays, week_type FROM trash_schedule WHERE group_id = %s', (user_group,))
@@ -884,7 +870,7 @@ def handle_message(event):
             if text.isdigit() and len(text) == 6:
                 conn = get_db()
                 cur = conn.cursor()
-                cur.execute('SELECT group_id FROM groups WHERE invite_code = %s AND active = TRUE', (text,))
+                cur.execute('SELECT group_id FROM groups WHERE invite_code = %s', (text,))
                 row = cur.fetchone()
                 if row:
                     group_id = row[0]
@@ -956,12 +942,10 @@ def handle_join(event):
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute('UPDATE groups SET active = FALSE')
         cur.execute(
-            'INSERT INTO groups (group_id, active, invite_code) VALUES (%s, TRUE, %s) ON CONFLICT (group_id) DO UPDATE SET active = TRUE, invite_code = %s',
+            'INSERT INTO groups (group_id, invite_code) VALUES (%s, %s) ON CONFLICT (group_id) DO UPDATE SET invite_code = %s',
             (group_id, invite_code, invite_code)
         )
-        cur.execute('UPDATE members SET group_id = %s WHERE group_id IS NULL', (group_id,))
         conn.commit()
         cur.close()
         conn.close()
