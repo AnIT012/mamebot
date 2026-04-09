@@ -285,11 +285,11 @@ def make_hour_qr(hours, context):
 def make_minute_qr(context):
     return QuickReply(items=[
         QuickReplyItem(action=PostbackAction(label=f'{m:02d}分', data=f'action=分&value={m}&context={context}'))
-        for m in
+        for m in [0,5,10,15,20,25,30,35,40,45,50,55]
     ])
 
-AM_HOURS =
-PM_HOURS =
+AM_HOURS = [6,7,8,9,10,11]
+PM_HOURS = [12,13,14,15,16,17,18,19,20,21,22,23]
 
 @app.route("/callback", methods=['POST'])
 def callback():
