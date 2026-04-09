@@ -28,6 +28,8 @@ def get_db():
 def init_db():
     conn = get_db()
     cur = conn.cursor()
+    
+    # 1. まずはベースとなるテーブル作成を確実にコミット（保存）する
     cur.execute('''
         CREATE TABLE IF NOT EXISTS trash_schedule (
             id SERIAL PRIMARY KEY,
@@ -45,40 +47,16 @@ def init_db():
     cur.execute('''
         CREATE TABLE IF NOT EXISTS groups (
             id SERIAL PRIMARY KEY,
-            group_id TEXT UNIQUE,
-            active BOOLEAN DEFAULT FALSE,
-            invite_code TEXT UNIQUE
+            group_id TEXT UNIQUE
         )
     ''')
-    try:
-        cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT FALSE')
-    except:
-        conn.rollback()
-    try:
-        cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS invite_code TEXT UNIQUE')
-    except:
-        conn.rollback()
     cur.execute('''
         CREATE TABLE IF NOT EXISTS members (
             id SERIAL PRIMARY KEY,
             user_id TEXT,
-            display_name TEXT,
-            group_id TEXT,
-            UNIQUE (user_id, group_id)
+            display_name TEXT
         )
     ''')
-    try:
-        cur.execute('ALTER TABLE members ADD COLUMN IF NOT EXISTS group_id TEXT')
-    except:
-        conn.rollback()
-    try:
-        cur.execute('ALTER TABLE members DROP CONSTRAINT IF EXISTS members_user_id_key')
-    except:
-        conn.rollback()
-    try:
-        cur.execute('ALTER TABLE members ADD CONSTRAINT members_user_group_unique UNIQUE (user_id, group_id)')
-    except:
-        conn.rollback()
     cur.execute('''
         CREATE TABLE IF NOT EXISTS daily_schedule (
             id SERIAL PRIMARY KEY,
@@ -98,11 +76,45 @@ def init_db():
             UNIQUE (done_date)
         )
     ''')
+    conn.commit() # 一度ここで確定させる（これで他のエラーに巻き込まれなくなります）
+
+    # 2. 追加のカラム（引き出し）を1つずつ安全に追加する
     try:
-        cur.execute('ALTER TABLE daily_schedule ADD CONSTRAINT unique_daily_user UNIQUE (user_id, created_date)')
+        cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT FALSE')
+        conn.commit()
     except:
         conn.rollback()
-    conn.commit()
+        
+    try:
+        cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS invite_code TEXT UNIQUE')
+        conn.commit()
+    except:
+        conn.rollback()
+        
+    try:
+        cur.execute('ALTER TABLE members ADD COLUMN IF NOT EXISTS group_id TEXT')
+        conn.commit()
+    except:
+        conn.rollback()
+        
+    try:
+        cur.execute('ALTER TABLE members DROP CONSTRAINT IF EXISTS members_user_id_key')
+        conn.commit()
+    except:
+        conn.rollback()
+        
+    try:
+        cur.execute('ALTER TABLE members ADD CONSTRAINT members_user_group_unique UNIQUE (user_id, group_id)')
+        conn.commit()
+    except:
+        conn.rollback()
+        
+    try:
+        cur.execute('ALTER TABLE daily_schedule ADD CONSTRAINT unique_daily_user UNIQUE (user_id, created_date)')
+        conn.commit()
+    except:
+        conn.rollback()
+
     cur.close()
     conn.close()
 
@@ -114,7 +126,7 @@ def get_group_ids():
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        ids = [row[0] for row in rows]
+        ids = [row for row in rows]
         if not ids:
             fallback = os.environ.get('LINE_GROUP_ID')
             if fallback:
@@ -126,7 +138,7 @@ def get_group_ids():
 
 def get_active_gid():
     ids = get_group_ids()
-    return ids[0] if ids else None
+    return ids if ids else None
 
 def push_members(text):
     try:
@@ -240,7 +252,7 @@ def reminder_loop():
             cur.execute('SELECT notify_time FROM bath_schedule LIMIT 1')
             row = cur.fetchone()
             if row:
-                notify_dt = datetime.combine(now.date(), row[0])
+                notify_dt = datetime.combine(now.date(), row)
                 diff = abs((now - notify_dt).total_seconds())
                 if diff < 90:
                     today_date = get_jst_date()
@@ -268,11 +280,11 @@ def make_hour_qr(hours, context):
 def make_minute_qr(context):
     return QuickReply(items=[
         QuickReplyItem(action=PostbackAction(label=f'{m:02d}分', data=f'action=分&value={m}&context={context}'))
-        for m in [0,5,10,15,20,25,30,35,40,45,50,55]
+        for m in
     ])
 
-AM_HOURS = [6,7,8,9,10,11]
-PM_HOURS = [12,13,14,15,16,17,18,19,20,21,22,23]
+AM_HOURS =
+PM_HOURS =
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -350,7 +362,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         cur.close()
         conn.close()
         if row:
-            current_time = row[0].strftime('%H:%M')
+            current_time = row.strftime('%H:%M')
             reply = TextMessage(text=f'お風呂の状況を教えてください！\n\n現在のお風呂未洗い通知時間: {current_time}', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='✅ 洗った', data='action=お風呂状況&value=洗いました🚿')),
                 QuickReplyItem(action=PostbackAction(label='🛁 洗って入れた', data='action=お風呂状況&value=洗ってお湯を入れました🛁')),
@@ -794,7 +806,7 @@ def handle_message(event):
                 cur.execute('SELECT group_id FROM groups WHERE invite_code = %s AND active = TRUE', (text,))
                 row = cur.fetchone()
                 if row:
-                    group_id = row[0]
+                    group_id = row
                     try:
                         profile = MessagingApi(api_client).get_profile(user_id)
                         name = profile.display_name
@@ -807,7 +819,16 @@ def handle_message(event):
                     conn.commit()
                     cur.close()
                     conn.close()
-                    reply = TextMessage(text=f'✅ 登録完了！グループと紐付けました😊\nメニューから各機能を使えます！')
+                    # 3. 登録完了時に使い方を追加
+                    reply = TextMessage(text=(
+                        '✅ 登録完了！グループと紐付けました😊\n\n'
+                        '📖 さっそく使ってみましょう！\n'
+                        '🍚 ごはん: 夕食の予定を共有\n'
+                        '🚃 出発・帰宅: 今日の時間を共有\n'
+                        '🛁 お風呂: 洗った報告やお願い\n'
+                        '🗑️ ゴミの日: 収集日の通知設定\n\n'
+                        '画面下のメニューから選んでみてください👇'
+                    ))
                 else:
                     cur.close()
                     conn.close()
@@ -866,6 +887,7 @@ def handle_join(event):
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
+        # 4. グループ参加時の案内に友達追加リンクを追加
         line_bot_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
@@ -873,11 +895,11 @@ def handle_join(event):
                     'まめBotがグループに参加しました🫘\n\n'
                     '家族の日常をもっとスムーズにするお手伝いをします。\n\n'
                     '【登録手順】\n'
-                    '① まめBotを個別で友達追加\n'
-                    '② 個別チャットで下の登録コードを入力\n'
-                    '③ 登録完了！メニューから使えます\n\n'
-                    f'登録コード: 【{invite_code}】\n\n'
-                    '※コードはグループにまめBotを追加し直すと変わります'
+                    '① 下のリンクからまめBotを友達追加👇\n'
+                    'https://line.me/R/ti/p/@240fwfwn\n\n'
+                    '② まめBotとの「個別チャット」で下のコードを送信\n\n'
+                    f'🔑 登録コード: 【{invite_code}】\n\n'
+                    '③ 登録完了！メニューから使えます😊'
                 )]
             )
         )
