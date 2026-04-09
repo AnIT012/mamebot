@@ -81,7 +81,9 @@ def init_db():
             UNIQUE (done_date)
         )
     ''')
-    conn.commit() # 一度ここで確定させる（これで他のエラーに巻き込まれなくなります）
+    conn.commit()
+    cur.execute('DELETE FROM members WHERE group_id IS NULL OR group_id NOT IN (SELECT group_id FROM groups WHERE active = TRUE)')
+    conn.commit()
 
     # 2. 追加のカラム（引き出し）を1つずつ安全に追加する
     try:
@@ -233,7 +235,7 @@ def send_dinner_summary():
     for (u_name,) in unanswered:
         summary += f'\n{u_name}: 未回答'
     push_group(summary)
-    
+
 def reminder_loop():
     while True:
         try:
