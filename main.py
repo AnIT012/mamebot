@@ -82,8 +82,6 @@ def init_db():
         )
     ''')
     conn.commit()
-    cur.execute('DELETE FROM members WHERE group_id IS NULL OR group_id NOT IN (SELECT group_id FROM groups WHERE active = TRUE)')
-    conn.commit()
 
     # 2. 追加のカラム（引き出し）を1つずつ安全に追加する
     try:
