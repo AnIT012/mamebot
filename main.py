@@ -198,11 +198,13 @@ def push_group(text):
 
 def send_dinner_summary():
     active_gid = get_active_gid()
+    print(f'DEBUG active_gid: {active_gid}')
     today = get_jst_date()
     conn = get_db()
     cur = conn.cursor()
     cur.execute('SELECT user_name, meal_status FROM daily_schedule WHERE created_date = %s ORDER BY id', (today,))
     responses = cur.fetchall()
+    print(f'DEBUG responses: {responses}')
     if active_gid:
         cur.execute('''
             SELECT display_name FROM members
@@ -212,24 +214,8 @@ def send_dinner_summary():
                 WHERE created_date = %s AND meal_status IS NOT NULL
             )
         ''', (active_gid, today))
-    else:
-        cur.execute('''
-            SELECT display_name FROM members
-            WHERE user_id NOT IN (
-                SELECT user_id FROM daily_schedule
-                WHERE created_date = %s AND meal_status IS NOT NULL
-            )
-        ''', (today,))
-    unanswered = cur.fetchall()
-    cur.close()
-    conn.close()
-    summary = '🍚 夕食まとめ'
-    for r_name, r_meal in responses:
-        if r_meal:
-            summary += f'\n{r_name}: {r_meal}'
-    for (u_name,) in unanswered:
-        summary += f'\n{u_name}: 未回答'
-    push_group(summary)
+    cur.execute_result = cur.fetchall()
+    print(f'DEBUG unanswered: {cur.execute_result}')
 
 def reminder_loop():
     while True:
