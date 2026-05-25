@@ -1,164 +1,251 @@
-from flask import Flask, request, abort
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, PushMessageRequest, TextMessage, QuickReply, QuickReplyItem, MessageAction, PostbackAction
-from linebot.v3.webhook import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent, JoinEvent, FollowEvent, LeaveEvent
+import json
+import logging
 import os
-import psycopg2
 import random
-from datetime import datetime, timedelta, timezone, date
 import threading
 import time
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qsl
+
+import psycopg2
+import psycopg2.errors
 import requests as http_requests
+from flask import Flask, abort, request
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.messaging import (
+    ApiClient,
+    Configuration,
+    MessagingApi,
+    PostbackAction,
+    QuickReply,
+    QuickReplyItem,
+    ReplyMessageRequest,
+    TextMessage,
+)
+from linebot.v3.webhook import WebhookHandler
+from linebot.v3.webhooks import (
+    FollowEvent,
+    JoinEvent,
+    LeaveEvent,
+    MessageEvent,
+    PostbackEvent,
+    TextMessageContent,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+)
+logger = logging.getLogger('mamebot')
 
 app = Flask(__name__)
+
+LINE_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
+LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
+DATABASE_URL = os.environ.get('DATABASE_URL')
+
+configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+JST = timezone(timedelta(hours=9))
+
+
+def get_jst_date():
+    return datetime.now(JST).date()
+
 
 @app.route("/", methods=['GET', 'HEAD'])
 def health_check():
     return "OK", 200
 
-configuration = Configuration(access_token=os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
-handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
-DATABASE_URL = os.environ.get('DATABASE_URL')
 
-JST = timezone(timedelta(hours=9))
+# ============================================================
+# DB
+# ============================================================
 
-def get_jst_date():
-    return datetime.now(JST).date()
+@contextmanager
+def db():
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
-def get_db():
-    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS trash_schedule (
-            id SERIAL PRIMARY KEY,
-            group_id TEXT,
-            trash_type VARCHAR(50),
-            weekdays TEXT,
-            week_type TEXT DEFAULT 'every'
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS bath_schedule (
-            id SERIAL PRIMARY KEY,
-            group_id TEXT UNIQUE,
-            notify_time TIME
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS groups (
-            id SERIAL PRIMARY KEY,
-            group_id TEXT UNIQUE,
-            invite_code TEXT UNIQUE
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS members (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT,
-            display_name TEXT,
-            group_id TEXT,
-            UNIQUE (user_id, group_id)
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS daily_schedule (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT,
-            user_name TEXT,
-            depart_time TEXT,
-            arrive_time TEXT,
-            meal_status TEXT,
-            created_date DATE,
-            UNIQUE (user_id, created_date)
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS bath_done (
-            id SERIAL PRIMARY KEY,
-            group_id TEXT,
-            done_date DATE,
-            UNIQUE (group_id, done_date)
-        )
-    ''')
-    conn.commit()
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS trash_schedule (
+                id SERIAL PRIMARY KEY,
+                group_id TEXT,
+                trash_type VARCHAR(50),
+                weekdays TEXT,
+                week_type TEXT DEFAULT 'every'
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS bath_schedule (
+                id SERIAL PRIMARY KEY,
+                group_id TEXT UNIQUE,
+                notify_time TIME
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS groups (
+                id SERIAL PRIMARY KEY,
+                group_id TEXT UNIQUE,
+                invite_code TEXT UNIQUE
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS members (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT,
+                display_name TEXT,
+                group_id TEXT,
+                UNIQUE (user_id, group_id)
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS daily_schedule (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT,
+                user_name TEXT,
+                depart_time TEXT,
+                arrive_time TEXT,
+                meal_status TEXT,
+                created_date DATE,
+                UNIQUE (user_id, created_date)
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS bath_done (
+                id SERIAL PRIMARY KEY,
+                group_id TEXT,
+                done_date DATE,
+                UNIQUE (group_id, done_date)
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS reminder_sent (
+                id SERIAL PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                target_date DATE NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (group_id, kind, target_date)
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS user_state (
+                user_id TEXT PRIMARY KEY,
+                state JSONB NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        ''')
+        conn.commit()
 
-    try:
+        # Idempotent migrations — ADD COLUMN/DROP CONSTRAINT IF [NOT] EXISTS は安全に再実行可
         cur.execute('ALTER TABLE groups ADD COLUMN IF NOT EXISTS invite_code TEXT UNIQUE')
-        conn.commit()
-    except:
-        conn.rollback()
-    try:
         cur.execute('ALTER TABLE members ADD COLUMN IF NOT EXISTS group_id TEXT')
-        conn.commit()
-    except:
-        conn.rollback()
-    try:
         cur.execute('ALTER TABLE members DROP CONSTRAINT IF EXISTS members_user_id_key')
-        conn.commit()
-    except:
-        conn.rollback()
-    try:
-        cur.execute('ALTER TABLE members ADD CONSTRAINT members_user_group_unique UNIQUE (user_id, group_id)')
-        conn.commit()
-    except:
-        conn.rollback()
-    try:
-        cur.execute('ALTER TABLE daily_schedule ADD CONSTRAINT unique_daily_user UNIQUE (user_id, created_date)')
-        conn.commit()
-    except:
-        conn.rollback()
-    try:
         cur.execute('ALTER TABLE trash_schedule ADD COLUMN IF NOT EXISTS group_id TEXT')
-        conn.commit()
-    except:
-        conn.rollback()
-    try:
         cur.execute("ALTER TABLE trash_schedule ADD COLUMN IF NOT EXISTS week_type TEXT DEFAULT 'every'")
-        conn.commit()
-    except:
-        conn.rollback()
-    try:
         cur.execute('ALTER TABLE bath_schedule ADD COLUMN IF NOT EXISTS group_id TEXT')
-        conn.commit()
-    except:
-        conn.rollback()
-    try:
         cur.execute('ALTER TABLE bath_done ADD COLUMN IF NOT EXISTS group_id TEXT')
         conn.commit()
-    except:
-        conn.rollback()
-    try:
-        cur.execute('ALTER TABLE bath_schedule ADD CONSTRAINT bath_schedule_group_id_unique UNIQUE (group_id)')
+
+        # ADD CONSTRAINT は IF NOT EXISTS 不可。既存時の DuplicateObject だけ握る。
+        for ddl in [
+            'ALTER TABLE members ADD CONSTRAINT members_user_group_unique UNIQUE (user_id, group_id)',
+            'ALTER TABLE daily_schedule ADD CONSTRAINT unique_daily_user UNIQUE (user_id, created_date)',
+            'ALTER TABLE bath_schedule ADD CONSTRAINT bath_schedule_group_id_unique UNIQUE (group_id)',
+        ]:
+            try:
+                cur.execute(ddl)
+                conn.commit()
+            except psycopg2.errors.DuplicateObject:
+                conn.rollback()
+            except psycopg2.errors.DuplicateTable:
+                conn.rollback()
+        cur.close()
+
+
+# ============================================================
+# user_state (DB-backed)
+# ============================================================
+
+def get_state(user_id):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT state FROM user_state WHERE user_id = %s', (user_id,))
+        row = cur.fetchone()
+        cur.close()
+    return row[0] if row else None
+
+
+def set_state(user_id, state):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            '''INSERT INTO user_state (user_id, state, updated_at) VALUES (%s, %s, NOW())
+               ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()''',
+            (user_id, json.dumps(state, ensure_ascii=False)),
+        )
         conn.commit()
-    except:
-        conn.rollback()
+        cur.close()
 
-    cur.close()
-    conn.close()
 
+def update_state(user_id, **patch):
+    current = get_state(user_id) or {}
+    current.update(patch)
+    set_state(user_id, current)
+
+
+def clear_state(user_id):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute('DELETE FROM user_state WHERE user_id = %s', (user_id,))
+        conn.commit()
+        cur.close()
+
+
+# ============================================================
+# Helpers
+# ============================================================
 
 def get_user_group(user_id):
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT group_id FROM members WHERE user_id = %s AND group_id IS NOT NULL ORDER BY id DESC LIMIT 1', (user_id,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'SELECT group_id FROM members WHERE user_id = %s AND group_id IS NOT NULL ORDER BY id DESC LIMIT 1',
+                (user_id,),
+            )
+            row = cur.fetchone()
+            cur.close()
         return row[0] if row else None
-    except:
+    except Exception as e:
+        logger.warning(f'get_user_group failed: {e}')
         return None
+
+
+def get_display_name(api_client, user_id, default='だれか'):
+    try:
+        return MessagingApi(api_client).get_profile(user_id).display_name
+    except Exception as e:
+        logger.warning(f'get_profile failed for {user_id}: {e}')
+        return default
+
 
 def push_to_group(group_id, text):
     if not group_id:
         return
     headers = {
         'Content-Type': 'application/json',
-        'Authorization': f'Bearer {os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")}'
+        'Authorization': f'Bearer {LINE_ACCESS_TOKEN}',
     }
     data = {
         'to': group_id,
@@ -168,57 +255,71 @@ def push_to_group(group_id, text):
             'substitution': {
                 'mention': {
                     'type': 'mention',
-                    'mentionee': {'type': 'all'}
-                }
-            }
-        }]
+                    'mentionee': {'type': 'all'},
+                },
+            },
+        }],
     }
-    res = http_requests.post('https://api.line.me/v2/bot/message/push', headers=headers, json=data)
-    print(f'push_to_group: status={res.status_code}')
+    try:
+        res = http_requests.post(
+            'https://api.line.me/v2/bot/message/push',
+            headers=headers,
+            json=data,
+            timeout=10,
+        )
+        logger.info(f'push_to_group status={res.status_code} group={group_id}')
+        if res.status_code >= 400:
+            logger.warning(f'push_to_group body={res.text}')
+    except Exception as e:
+        logger.warning(f'push_to_group failed: {e}')
+
 
 def push_members(text, group_id):
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT user_id FROM members WHERE group_id = %s', (group_id,))
-        member_ids = cur.fetchall()
-        cur.close()
-        conn.close()
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT user_id FROM members WHERE group_id = %s', (group_id,))
+            member_ids = cur.fetchall()
+            cur.close()
         headers = {
             'Content-Type': 'application/json',
-            'Authorization': f'Bearer {os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")}'
+            'Authorization': f'Bearer {LINE_ACCESS_TOKEN}',
         }
         for (mid,) in member_ids:
-            http_requests.post(
-                'https://api.line.me/v2/bot/message/push',
-                headers=headers,
-                json={'to': mid, 'messages': [{'type': 'text', 'text': text}]}
-            )
+            try:
+                http_requests.post(
+                    'https://api.line.me/v2/bot/message/push',
+                    headers=headers,
+                    json={'to': mid, 'messages': [{'type': 'text', 'text': text}]},
+                    timeout=10,
+                )
+            except Exception as e:
+                logger.warning(f'push to member {mid} failed: {e}')
     except Exception as e:
-        print(f'Push members error: {e}')
+        logger.warning(f'push_members failed: {e}')
+
 
 def send_dinner_summary(group_id):
     today = get_jst_date()
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute('''
-        SELECT user_name, meal_status FROM daily_schedule
-        WHERE created_date = %s
-        AND user_id IN (SELECT user_id FROM members WHERE group_id = %s)
-        ORDER BY id
-    ''', (today, group_id))
-    responses = cur.fetchall()
-    cur.execute('''
-        SELECT display_name FROM members
-        WHERE group_id = %s
-        AND user_id NOT IN (
-            SELECT user_id FROM daily_schedule
-            WHERE created_date = %s AND meal_status IS NOT NULL
-        )
-    ''', (group_id, today))
-    unanswered = cur.fetchall()
-    cur.close()
-    conn.close()
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT user_name, meal_status FROM daily_schedule
+            WHERE created_date = %s
+            AND user_id IN (SELECT user_id FROM members WHERE group_id = %s)
+            ORDER BY id
+        ''', (today, group_id))
+        responses = cur.fetchall()
+        cur.execute('''
+            SELECT display_name FROM members
+            WHERE group_id = %s
+            AND user_id NOT IN (
+                SELECT user_id FROM daily_schedule
+                WHERE created_date = %s AND meal_status IS NOT NULL
+            )
+        ''', (group_id, today))
+        unanswered = cur.fetchall()
+        cur.close()
     summary = '🍚 夕食まとめ'
     for r_name, r_meal in responses:
         if r_meal:
@@ -227,74 +328,105 @@ def send_dinner_summary(group_id):
         summary += f'\n{u_name}: 未回答'
     push_to_group(group_id, summary)
 
+
 def is_nth_week(date_obj, nth_weeks):
     week_of_month = (date_obj.day - 1) // 7 + 1
     return week_of_month in nth_weeks
 
+
+def mark_reminder(group_id, kind, target_date):
+    """同一 group/kind/date は1回だけ通知する。新規登録に成功した時 True。"""
+    try:
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                '''INSERT INTO reminder_sent (group_id, kind, target_date) VALUES (%s, %s, %s)
+                   ON CONFLICT (group_id, kind, target_date) DO NOTHING RETURNING id''',
+                (group_id, kind, target_date),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            cur.close()
+        return row is not None
+    except Exception as e:
+        logger.warning(f'mark_reminder failed: {e}')
+        return False
+
+
+# ============================================================
+# Reminder loop
+# ============================================================
+
 def reminder_loop():
+    weekday_map = {0: '月', 1: '火', 2: '水', 3: '木', 4: '金', 5: '土', 6: '日'}
     while True:
         try:
-            conn = get_db()
-            cur = conn.cursor()
             now = datetime.now(JST).replace(tzinfo=None)
             today_date = get_jst_date()
-            weekday_map = {0:'月',1:'火',2:'水',3:'木',4:'金',5:'土',6:'日'}
             today = weekday_map[now.weekday()]
             yesterday = weekday_map[(now.weekday() - 1) % 7]
             yesterday_date = today_date - timedelta(days=1)
 
-            cur.execute('SELECT group_id, trash_type, weekdays, week_type FROM trash_schedule')
-            for group_id, trash_type, weekdays, week_type in cur.fetchall():
-                if not group_id:
-                    continue
-                if today in weekdays:
-                    should_notify = False
-                    if week_type == 'every':
-                        should_notify = True
-                    elif week_type == 'odd':
-                        should_notify = is_nth_week(today_date, [1, 3])
-                    elif week_type == 'even':
-                        should_notify = is_nth_week(today_date, [2, 4])
-                    if should_notify:
+            with db() as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT group_id, trash_type, weekdays, week_type FROM trash_schedule')
+                trash_rows = cur.fetchall()
+                cur.execute('SELECT group_id, notify_time FROM bath_schedule')
+                bath_rows = cur.fetchall()
+
+                for group_id, trash_type, weekdays, week_type in trash_rows:
+                    if not group_id:
+                        continue
+                    if today in weekdays and _should_notify_week(week_type, today_date):
                         notify_dt = datetime.combine(now.date(), datetime.strptime('07:00', '%H:%M').time())
-                        diff = abs((now - notify_dt).total_seconds())
-                        if diff < 90:
-                            push_to_group(group_id, f'⏰ リマインド\n🗑️ 今日は{trash_type}の日です！忘れずに！')
-                if yesterday in weekdays:
-                    should_notify = False
-                    if week_type == 'every':
-                        should_notify = True
-                    elif week_type == 'odd':
-                        should_notify = is_nth_week(yesterday_date, [1, 3])
-                    elif week_type == 'even':
-                        should_notify = is_nth_week(yesterday_date, [2, 4])
-                    if should_notify:
+                        if abs((now - notify_dt).total_seconds()) < 90:
+                            if mark_reminder(group_id, f'trash_today:{trash_type}', today_date):
+                                push_to_group(group_id, f'⏰ リマインド\n🗑️ 今日は{trash_type}の日です！忘れずに！')
+                    if yesterday in weekdays and _should_notify_week(week_type, yesterday_date):
                         notify_dt = datetime.combine(now.date(), datetime.strptime('21:00', '%H:%M').time())
-                        diff = abs((now - notify_dt).total_seconds())
-                        if diff < 90:
-                            push_to_group(group_id, f'⏰ リマインド\n🗑️ 明日は{trash_type}の日です！準備を忘れずに！')
+                        if abs((now - notify_dt).total_seconds()) < 90:
+                            if mark_reminder(group_id, f'trash_tomorrow:{trash_type}', yesterday_date):
+                                push_to_group(group_id, f'⏰ リマインド\n🗑️ 明日は{trash_type}の日です！準備を忘れずに！')
 
-            cur.execute('SELECT group_id, notify_time FROM bath_schedule')
-            for group_id, notify_time in cur.fetchall():
-                if not group_id:
-                    continue
-                notify_dt = datetime.combine(now.date(), notify_time)
-                diff = abs((now - notify_dt).total_seconds())
-                if diff < 90:
-                    cur2 = conn.cursor()
-                    cur2.execute('SELECT id FROM bath_done WHERE group_id = %s AND done_date = %s', (group_id, today_date))
-                    done = cur2.fetchone()
-                    cur2.close()
-                    if not done:
-                        push_to_group(group_id, '⏰ リマインド\n🛁 まだお風呂が洗われていません！')
-
-            cur.close()
-            conn.close()
+                for group_id, notify_time in bath_rows:
+                    if not group_id:
+                        continue
+                    notify_dt = datetime.combine(now.date(), notify_time)
+                    if abs((now - notify_dt).total_seconds()) < 90:
+                        cur.execute(
+                            'SELECT id FROM bath_done WHERE group_id = %s AND done_date = %s',
+                            (group_id, today_date),
+                        )
+                        done = cur.fetchone()
+                        if not done and mark_reminder(group_id, 'bath_unwashed', today_date):
+                            push_to_group(group_id, '⏰ リマインド\n🛁 まだお風呂が洗われていません！')
+                cur.close()
         except Exception as e:
-            print(f'Reminder error: {e}')
+            logger.warning(f'Reminder loop error: {e}')
         time.sleep(60)
 
-user_state = {}
+
+def _should_notify_week(week_type, date_obj):
+    if week_type == 'every':
+        return True
+    if week_type == 'odd':
+        return is_nth_week(date_obj, [1, 3])
+    if week_type == 'even':
+        return is_nth_week(date_obj, [2, 4])
+    return False
+
+
+# ============================================================
+# Quick Reply factories
+# ============================================================
+
+AM_HOURS = [6, 7, 8, 9, 10, 11]
+PM_HOURS = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+WEEKDAY_ITEMS = [
+    QuickReplyItem(action=PostbackAction(label=w, data=f'action=ゴミ曜日&value={w}'))
+    for w in ['月', '火', '水', '木', '金', '土', '日']
+]
+
 
 def make_hour_qr(hours, context):
     return QuickReply(items=[
@@ -302,32 +434,46 @@ def make_hour_qr(hours, context):
         for h in hours
     ])
 
+
 def make_minute_qr(context):
     return QuickReply(items=[
         QuickReplyItem(action=PostbackAction(label=f'{m:02d}分', data=f'action=分&value={m}&context={context}'))
-        for m in [0,5,10,15,20,25,30,35,40,45,50,55]
+        for m in [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]
     ])
 
-AM_HOURS = [6,7,8,9,10,11]
-PM_HOURS = [12,13,14,15,16,17,18,19,20,21,22,23]
+
+# ============================================================
+# Webhook
+# ============================================================
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers['X-Line-Signature']
+    signature = request.headers.get('X-Line-Signature')
+    if not signature:
+        logger.warning('Missing X-Line-Signature header')
+        abort(400)
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
+        logger.warning('Invalid signature')
         abort(400)
     return 'OK'
+
 
 def send_reply(api_client, reply_token, reply):
     MessagingApi(api_client).reply_message(
         ReplyMessageRequest(reply_token=reply_token, messages=[reply])
     )
 
+
 def not_registered_reply():
     return TextMessage(text='グループへの登録が必要です。\nグループに表示された登録コード（6桁）をここに入力してください。')
+
+
+# ============================================================
+# Action processor
+# ============================================================
 
 def process_action(action, value, context, user_id, api_client, reply_token):
     today = get_jst_date()
@@ -335,7 +481,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     # ========== ごはん ==========
     if action == 'ごはん':
-        user_state.pop(user_id, None)
+        clear_state(user_id)
         if not user_group:
             send_reply(api_client, reply_token, not_registered_reply())
             return
@@ -352,52 +498,41 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         ]))
 
     elif action == '夕食登録':
-        try:
-            name = MessagingApi(api_client).get_profile(user_id).display_name
-        except:
-            name = 'だれか'
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            '''INSERT INTO daily_schedule (user_id, user_name, meal_status, created_date)
-               VALUES (%s, %s, %s, %s)
-               ON CONFLICT (user_id, created_date) DO UPDATE SET
-               meal_status=EXCLUDED.meal_status, user_name=EXCLUDED.user_name''',
-            (user_id, name, value, today)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        name = get_display_name(api_client, user_id)
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                '''INSERT INTO daily_schedule (user_id, user_name, meal_status, created_date)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (user_id, created_date) DO UPDATE SET
+                   meal_status=EXCLUDED.meal_status, user_name=EXCLUDED.user_name''',
+                (user_id, name, value, today),
+            )
+            conn.commit()
+            cur.close()
         if user_group:
             send_dinner_summary(user_group)
         reply = TextMessage(text=f'以下の内容を家族グループに送りました☑️\n・夕食: {value}')
 
     elif action == 'ごはんできた':
-        try:
-            name = MessagingApi(api_client).get_profile(user_id).display_name
-        except:
-            name = 'だれか'
+        name = get_display_name(api_client, user_id)
         if user_group:
             push_to_group(user_group, f'🍚 {name}がご飯を作りました！みんな集まってください！')
         reply = TextMessage(text='以下の内容を家族グループに送りました☑️\n・ごはんができました！')
 
     # ========== お風呂 ==========
     elif action == 'お風呂':
-        user_state.pop(user_id, None)
+        clear_state(user_id)
         if not user_group:
             send_reply(api_client, reply_token, not_registered_reply())
             return
-        try:
-            name = MessagingApi(api_client).get_profile(user_id).display_name
-        except:
-            name = 'あなた'
-        user_state[user_id] = {'name': name}
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT notify_time FROM bath_schedule WHERE group_id = %s LIMIT 1', (user_group,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
+        name = get_display_name(api_client, user_id, default='あなた')
+        set_state(user_id, {'name': name})
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT notify_time FROM bath_schedule WHERE group_id = %s LIMIT 1', (user_group,))
+            row = cur.fetchone()
+            cur.close()
         if row:
             current_time = row[0].strftime('%H:%M')
             reply = TextMessage(text=f'お風呂の状況を教えてください！\n\n現在のお風呂未洗い通知時間: {current_time}', quick_reply=QuickReply(items=[
@@ -415,16 +550,18 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             ]))
 
     elif action == 'お風呂状況':
-        name = user_state.get(user_id, {}).get('name', 'だれか')
+        name = (get_state(user_id) or {}).get('name', 'だれか')
         if user_group:
-            conn = get_db()
-            cur = conn.cursor()
-            cur.execute('INSERT INTO bath_done (group_id, done_date) VALUES (%s, %s) ON CONFLICT DO NOTHING', (user_group, today))
-            conn.commit()
-            cur.close()
-            conn.close()
+            with db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    'INSERT INTO bath_done (group_id, done_date) VALUES (%s, %s) ON CONFLICT DO NOTHING',
+                    (user_group, today),
+                )
+                conn.commit()
+                cur.close()
             push_to_group(user_group, f'🛁 {name}がお風呂を{value}')
-        user_state.pop(user_id, None)
+        clear_state(user_id)
         reply = TextMessage(text=f'以下の内容を家族グループに送りました☑️\n・お風呂を{value}')
 
     elif action == 'お風呂お願い':
@@ -439,7 +576,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         ]))
 
     elif action == 'お風呂時間設定':
-        user_state[user_id] = {'action': 'set_bath_hour'}
+        set_state(user_id, {'action': 'set_bath_hour'})
         reply = TextMessage(text='通知する時間帯を選んでください。', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='午前', data='action=お風呂時間帯&value=am')),
             QuickReplyItem(action=PostbackAction(label='午後', data='action=お風呂時間帯&value=pm')),
@@ -447,42 +584,39 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == 'お風呂時間帯':
         hours = AM_HOURS if value == 'am' else PM_HOURS
-        if user_id not in user_state:
-            user_state[user_id] = {}
-        user_state[user_id]['action'] = 'set_bath_minute'
+        update_state(user_id, action='set_bath_minute')
         reply = TextMessage(text='何時ですか？', quick_reply=make_hour_qr(hours, 'bath'))
 
     elif action == '時' and context == 'bath':
-        if user_id not in user_state:
-            user_state[user_id] = {}
-        user_state[user_id]['hour'] = int(value)
+        update_state(user_id, hour=int(value))
         reply = TextMessage(text='何分ですか？', quick_reply=make_minute_qr('bath'))
 
     elif action == '分' and context == 'bath':
-        hour = user_state.get(user_id, {}).get('hour')
+        state = get_state(user_id) or {}
+        hour = state.get('hour')
         if hour is None:
             send_reply(api_client, reply_token, TextMessage(text='お風呂メニューから最初からやり直してください。'))
             return
         minute = int(value)
         notify_time = f'{hour:02d}:{minute:02d}'
-        try:
-            name = MessagingApi(api_client).get_profile(user_id).display_name
-        except:
-            name = 'だれか'
+        name = get_display_name(api_client, user_id)
         if user_group:
-            conn = get_db()
-            cur = conn.cursor()
-            cur.execute('INSERT INTO bath_schedule (group_id, notify_time) VALUES (%s, %s) ON CONFLICT (group_id) DO UPDATE SET notify_time = %s', (user_group, notify_time, notify_time))
-            conn.commit()
-            cur.close()
-            conn.close()
+            with db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    '''INSERT INTO bath_schedule (group_id, notify_time) VALUES (%s, %s)
+                       ON CONFLICT (group_id) DO UPDATE SET notify_time = %s''',
+                    (user_group, notify_time, notify_time),
+                )
+                conn.commit()
+                cur.close()
             push_to_group(user_group, f'⚙️ 設定が更新されました\n🛁 お風呂未洗い通知時間: {notify_time}\n（{name}が設定）')
-        user_state.pop(user_id, None)
+        clear_state(user_id)
         reply = TextMessage(text=f'以下の設定を保存しました☑️\n・お風呂未洗い通知: {notify_time}')
 
     # ========== 出発・帰宅 ==========
     elif action == '出発・帰宅':
-        user_state.pop(user_id, None)
+        clear_state(user_id)
         if not user_group:
             send_reply(api_client, reply_token, not_registered_reply())
             return
@@ -492,7 +626,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         ]))
 
     elif action == '帰宅共有開始':
-        user_state[user_id] = {'action': 'share_type', 'depart': None, 'arrive': None}
+        set_state(user_id, {'action': 'share_type', 'depart': None, 'arrive': None})
         reply = TextMessage(text='どの時間を共有しますか？', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='🚶 出発のみ', data='action=共有タイプ&value=depart')),
             QuickReplyItem(action=PostbackAction(label='🏠 帰宅のみ', data='action=共有タイプ&value=arrive')),
@@ -500,15 +634,15 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         ]))
 
     elif action == '共有タイプ':
-        user_state[user_id]['share_type'] = value
+        update_state(user_id, share_type=value)
         if value == 'arrive':
-            user_state[user_id]['action'] = 'share_arrive_ampm'
+            update_state(user_id, action='share_arrive_ampm')
             reply = TextMessage(text='帰宅の時間帯を選んでください。', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='午前', data='action=帰宅時間帯&value=am')),
                 QuickReplyItem(action=PostbackAction(label='午後', data='action=帰宅時間帯&value=pm')),
             ]))
         else:
-            user_state[user_id]['action'] = 'share_depart_ampm'
+            update_state(user_id, action='share_depart_ampm')
             reply = TextMessage(text='出発の時間帯を選んでください。', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='午前', data='action=出発時間帯&value=am')),
                 QuickReplyItem(action=PostbackAction(label='午後', data='action=出発時間帯&value=pm')),
@@ -516,27 +650,28 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == '出発時間帯':
         hours = AM_HOURS if value == 'am' else PM_HOURS
-        user_state[user_id]['action'] = 'share_depart_hour'
+        update_state(user_id, action='share_depart_hour')
         reply = TextMessage(text='出発は何時ですか？', quick_reply=make_hour_qr(hours, 'depart'))
 
     elif action == '時' and context == 'depart':
-        user_state[user_id]['depart_hour'] = int(value)
+        update_state(user_id, depart_hour=int(value))
         reply = TextMessage(quick_reply=make_minute_qr('depart'), text='何分ですか？')
 
     elif action == '分' and context == 'depart':
-        hour = user_state[user_id]['depart_hour']
+        state = get_state(user_id) or {}
+        hour = state.get('depart_hour', 0)
         minute = int(value)
-        user_state[user_id]['depart'] = f'{hour:02d}:{minute:02d}'
-        share_type = user_state[user_id].get('share_type')
+        update_state(user_id, depart=f'{hour:02d}:{minute:02d}')
+        share_type = state.get('share_type')
         if share_type == 'both':
-            user_state[user_id]['action'] = 'share_arrive_ampm'
+            update_state(user_id, action='share_arrive_ampm')
             reply = TextMessage(text='帰宅の時間帯を選んでください。', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='午前', data='action=帰宅時間帯&value=am')),
                 QuickReplyItem(action=PostbackAction(label='午後', data='action=帰宅時間帯&value=pm')),
                 QuickReplyItem(action=PostbackAction(label='スキップ', data='action=帰宅スキップ')),
             ]))
         else:
-            user_state[user_id]['action'] = 'share_meal'
+            update_state(user_id, action='share_meal')
             reply = TextMessage(text='ご飯はどうしますか？', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='🏠 家で食べる', data='action=ごはん状況&value=家で食べる🏠')),
                 QuickReplyItem(action=PostbackAction(label='🍴 外で食べる', data='action=ごはん状況&value=外で食べる🍴')),
@@ -545,18 +680,18 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     elif action == '帰宅時間帯':
         hours = AM_HOURS if value == 'am' else PM_HOURS
-        user_state[user_id]['action'] = 'share_arrive_hour'
+        update_state(user_id, action='share_arrive_hour')
         reply = TextMessage(text='帰宅は何時ですか？', quick_reply=make_hour_qr(hours, 'arrive'))
 
     elif action == '時' and context == 'arrive':
-        user_state[user_id]['arrive_hour'] = int(value)
+        update_state(user_id, arrive_hour=int(value))
         reply = TextMessage(quick_reply=make_minute_qr('arrive'), text='何分ですか？')
 
     elif action == '分' and context == 'arrive':
-        hour = user_state[user_id]['arrive_hour']
+        state = get_state(user_id) or {}
+        hour = state.get('arrive_hour', 0)
         minute = int(value)
-        user_state[user_id]['arrive'] = f'{hour:02d}:{minute:02d}'
-        user_state[user_id]['action'] = 'share_meal'
+        update_state(user_id, arrive=f'{hour:02d}:{minute:02d}', action='share_meal')
         reply = TextMessage(text='ご飯はどうしますか？', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='🏠 家で食べる', data='action=ごはん状況&value=家で食べる🏠')),
             QuickReplyItem(action=PostbackAction(label='🍴 外で食べる', data='action=ごはん状況&value=外で食べる🍴')),
@@ -564,8 +699,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         ]))
 
     elif action == '帰宅スキップ':
-        user_state[user_id]['arrive'] = None
-        user_state[user_id]['action'] = 'share_meal'
+        update_state(user_id, arrive=None, action='share_meal')
         reply = TextMessage(text='ご飯はどうしますか？', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='🏠 家で食べる', data='action=ごはん状況&value=家で食べる🏠')),
             QuickReplyItem(action=PostbackAction(label='🍴 外で食べる', data='action=ごはん状況&value=外で食べる🍴')),
@@ -573,33 +707,33 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         ]))
 
     elif action == 'ごはん状況':
-        depart = user_state[user_id].get('depart')
-        arrive = user_state[user_id].get('arrive')
-        try:
-            name = MessagingApi(api_client).get_profile(user_id).display_name
-        except:
-            name = 'だれか'
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            '''INSERT INTO daily_schedule (user_id, user_name, depart_time, arrive_time, meal_status, created_date)
-               VALUES (%s, %s, %s, %s, %s, %s)
-               ON CONFLICT (user_id, created_date) DO UPDATE SET
-               depart_time=EXCLUDED.depart_time, arrive_time=EXCLUDED.arrive_time, meal_status=EXCLUDED.meal_status''',
-            (user_id, name, depart, arrive, value, today)
-        )
-        if user_group:
-            cur.execute('''
-                SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule
-                WHERE created_date = %s AND user_id IN (SELECT user_id FROM members WHERE group_id = %s)
-                ORDER BY id
-            ''', (today, user_group))
-        else:
-            cur.execute('SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule WHERE created_date = %s ORDER BY id', (today,))
-        rows = cur.fetchall()
-        conn.commit()
-        cur.close()
-        conn.close()
+        state = get_state(user_id) or {}
+        depart = state.get('depart')
+        arrive = state.get('arrive')
+        name = get_display_name(api_client, user_id)
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                '''INSERT INTO daily_schedule (user_id, user_name, depart_time, arrive_time, meal_status, created_date)
+                   VALUES (%s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (user_id, created_date) DO UPDATE SET
+                   depart_time=EXCLUDED.depart_time, arrive_time=EXCLUDED.arrive_time, meal_status=EXCLUDED.meal_status''',
+                (user_id, name, depart, arrive, value, today),
+            )
+            if user_group:
+                cur.execute('''
+                    SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule
+                    WHERE created_date = %s AND user_id IN (SELECT user_id FROM members WHERE group_id = %s)
+                    ORDER BY id
+                ''', (today, user_group))
+            else:
+                cur.execute(
+                    'SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule WHERE created_date = %s ORDER BY id',
+                    (today,),
+                )
+            rows = cur.fetchall()
+            conn.commit()
+            cur.close()
         if len(rows) == 1:
             parts = [f'🚃 {name}']
             if depart:
@@ -622,7 +756,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
                 summary += f'\n{" / ".join(line_parts)}'
             if user_group:
                 push_to_group(user_group, summary)
-        user_state.pop(user_id, None)
+        clear_state(user_id)
         confirm_parts = []
         if depart:
             confirm_parts.append(f'・出発 {depart}')
@@ -632,27 +766,32 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         reply = TextMessage(text='以下の内容を家族グループに送りました☑️\n' + '\n'.join(confirm_parts))
 
     elif action == '帰宅確認':
-        conn = get_db()
-        cur = conn.cursor()
-        if user_group:
-            cur.execute('''
-                SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule
-                WHERE created_date = %s AND user_id IN (SELECT user_id FROM members WHERE group_id = %s)
-                ORDER BY id
-            ''', (today, user_group))
-        else:
-            cur.execute('SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule WHERE created_date = %s ORDER BY id', (today,))
-        answered = cur.fetchall()
-        if user_group:
-            cur.execute('''
-                SELECT display_name FROM members WHERE group_id = %s
-                AND user_id NOT IN (SELECT user_id FROM daily_schedule WHERE created_date = %s)
-            ''', (user_group, today))
-        else:
-            cur.execute('SELECT display_name FROM members WHERE user_id NOT IN (SELECT user_id FROM daily_schedule WHERE created_date = %s)', (today,))
-        unanswered = cur.fetchall()
-        cur.close()
-        conn.close()
+        with db() as conn:
+            cur = conn.cursor()
+            if user_group:
+                cur.execute('''
+                    SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule
+                    WHERE created_date = %s AND user_id IN (SELECT user_id FROM members WHERE group_id = %s)
+                    ORDER BY id
+                ''', (today, user_group))
+            else:
+                cur.execute(
+                    'SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule WHERE created_date = %s ORDER BY id',
+                    (today,),
+                )
+            answered = cur.fetchall()
+            if user_group:
+                cur.execute('''
+                    SELECT display_name FROM members WHERE group_id = %s
+                    AND user_id NOT IN (SELECT user_id FROM daily_schedule WHERE created_date = %s)
+                ''', (user_group, today))
+            else:
+                cur.execute(
+                    'SELECT display_name FROM members WHERE user_id NOT IN (SELECT user_id FROM daily_schedule WHERE created_date = %s)',
+                    (today,),
+                )
+            unanswered = cur.fetchall()
+            cur.close()
         status_text = f'📋 今日の状況（{today.month}/{today.day}）'
         for r_name, r_depart, r_arrive, r_meal in answered:
             line_parts = [r_name]
@@ -680,20 +819,24 @@ def process_action(action, value, context, user_id, api_client, reply_token):
 
     # ========== ゴミの日 ==========
     elif action == 'ゴミの日':
-        user_state.pop(user_id, None)
+        clear_state(user_id)
         if not user_group:
             send_reply(api_client, reply_token, not_registered_reply())
             return
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT trash_type, weekdays, week_type FROM trash_schedule WHERE group_id = %s', (user_group,))
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'SELECT trash_type, weekdays, week_type FROM trash_schedule WHERE group_id = %s',
+                (user_group,),
+            )
+            rows = cur.fetchall()
+            cur.close()
         if rows:
             def week_type_label(wt):
-                if wt == 'odd': return '（第1・3週）'
-                if wt == 'even': return '（第2・4週）'
+                if wt == 'odd':
+                    return '（第1・3週）'
+                if wt == 'even':
+                    return '（第2・4週）'
                 return ''
             schedule_text = '\n'.join([f'・{t}: {w}曜日{week_type_label(wt)}' for t, w, wt in rows])
             reply = TextMessage(text=f'現在のゴミ出しスケジュール📅\n{schedule_text}\n\n前日21時と当日朝7時に通知します。', quick_reply=QuickReply(items=[
@@ -706,12 +849,11 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             ]))
 
     elif action == 'ゴミ変更選択':
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT trash_type, weekdays FROM trash_schedule WHERE group_id = %s', (user_group,))
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT trash_type, weekdays FROM trash_schedule WHERE group_id = %s', (user_group,))
+            rows = cur.fetchall()
+            cur.close()
         items = [
             QuickReplyItem(action=PostbackAction(label=f'✏️ {t}', data=f'action=ゴミ変更&value={t}'))
             for t, w in rows
@@ -722,34 +864,22 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         reply = TextMessage(text='変更・削除するゴミの種類を選んでください。', quick_reply=QuickReply(items=items[:13]))
 
     elif action == 'ゴミ変更':
-        user_state[user_id] = {'action': 'set_trash_days', 'trash_type': value, 'days': ''}
-        reply = TextMessage(text=f'「{value}」の新しい収集曜日を選んでください。', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='月', data='action=ゴミ曜日&value=月')),
-            QuickReplyItem(action=PostbackAction(label='火', data='action=ゴミ曜日&value=火')),
-            QuickReplyItem(action=PostbackAction(label='水', data='action=ゴミ曜日&value=水')),
-            QuickReplyItem(action=PostbackAction(label='木', data='action=ゴミ曜日&value=木')),
-            QuickReplyItem(action=PostbackAction(label='金', data='action=ゴミ曜日&value=金')),
-            QuickReplyItem(action=PostbackAction(label='土', data='action=ゴミ曜日&value=土')),
-            QuickReplyItem(action=PostbackAction(label='日', data='action=ゴミ曜日&value=日')),
-        ]))
+        set_state(user_id, {'action': 'set_trash_days', 'trash_type': value, 'days': ''})
+        reply = TextMessage(text=f'「{value}」の新しい収集曜日を選んでください。', quick_reply=QuickReply(items=WEEKDAY_ITEMS))
 
     elif action == 'ゴミ削除':
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('DELETE FROM trash_schedule WHERE trash_type=%s AND group_id=%s', (value, user_group))
-        conn.commit()
-        cur.close()
-        conn.close()
-        try:
-            name = MessagingApi(api_client).get_profile(user_id).display_name
-        except:
-            name = 'だれか'
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute('DELETE FROM trash_schedule WHERE trash_type=%s AND group_id=%s', (value, user_group))
+            conn.commit()
+            cur.close()
+        name = get_display_name(api_client, user_id)
         if user_group:
             push_to_group(user_group, f'⚙️ 設定が更新されました\n🗑️ {value}のスケジュールを削除しました\n（{name}が操作）')
         reply = TextMessage(text=f'以下の設定を保存しました☑️\n・{value}のスケジュールを削除しました')
 
     elif action == 'ゴミ登録':
-        user_state[user_id] = {'action': 'set_trash_days'}
+        set_state(user_id, {'action': 'set_trash_days'})
         reply = TextMessage(text='ゴミの種類を選んでください🗑️', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='燃えるゴミ', data='action=ゴミ種類&value=燃えるゴミ')),
             QuickReplyItem(action=PostbackAction(label='燃えないゴミ', data='action=ゴミ種類&value=燃えないゴミ')),
@@ -762,35 +892,21 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         ]))
 
     elif action == 'ゴミ種類':
-        user_state[user_id] = {'action': 'set_trash_days', 'trash_type': value, 'days': ''}
-        reply = TextMessage(text=f'「{value}」の収集曜日を選んでください。', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='月', data='action=ゴミ曜日&value=月')),
-            QuickReplyItem(action=PostbackAction(label='火', data='action=ゴミ曜日&value=火')),
-            QuickReplyItem(action=PostbackAction(label='水', data='action=ゴミ曜日&value=水')),
-            QuickReplyItem(action=PostbackAction(label='木', data='action=ゴミ曜日&value=木')),
-            QuickReplyItem(action=PostbackAction(label='金', data='action=ゴミ曜日&value=金')),
-            QuickReplyItem(action=PostbackAction(label='土', data='action=ゴミ曜日&value=土')),
-            QuickReplyItem(action=PostbackAction(label='日', data='action=ゴミ曜日&value=日')),
-        ]))
+        set_state(user_id, {'action': 'set_trash_days', 'trash_type': value, 'days': ''})
+        reply = TextMessage(text=f'「{value}」の収集曜日を選んでください。', quick_reply=QuickReply(items=WEEKDAY_ITEMS))
 
     elif action == 'ゴミ種類その他':
-        user_state[user_id] = {'action': 'set_trash_type_custom'}
+        set_state(user_id, {'action': 'set_trash_type_custom'})
         reply = TextMessage(text='ゴミの種類を入力してください。\n例: 古紙')
 
     elif action == 'ゴミ曜日':
-        if user_id in user_state and user_state[user_id].get('action') == 'set_trash_days':
-            current_days = user_state[user_id].get('days', '')
+        state = get_state(user_id)
+        if state and state.get('action') == 'set_trash_days':
+            current_days = state.get('days', '')
             if value not in current_days:
                 current_days += value
-            user_state[user_id]['days'] = current_days
-            reply = TextMessage(text=f'選択中: {current_days}曜日', quick_reply=QuickReply(items=[
-                QuickReplyItem(action=PostbackAction(label='月', data='action=ゴミ曜日&value=月')),
-                QuickReplyItem(action=PostbackAction(label='火', data='action=ゴミ曜日&value=火')),
-                QuickReplyItem(action=PostbackAction(label='水', data='action=ゴミ曜日&value=水')),
-                QuickReplyItem(action=PostbackAction(label='木', data='action=ゴミ曜日&value=木')),
-                QuickReplyItem(action=PostbackAction(label='金', data='action=ゴミ曜日&value=金')),
-                QuickReplyItem(action=PostbackAction(label='土', data='action=ゴミ曜日&value=土')),
-                QuickReplyItem(action=PostbackAction(label='日', data='action=ゴミ曜日&value=日')),
+            update_state(user_id, days=current_days)
+            reply = TextMessage(text=f'選択中: {current_days}曜日', quick_reply=QuickReply(items=WEEKDAY_ITEMS + [
                 QuickReplyItem(action=PostbackAction(label='✅ 次へ', data='action=ゴミ週タイプ選択')),
             ]))
         else:
@@ -804,25 +920,25 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         ]))
 
     elif action == 'ゴミ曜日完了':
-        if user_id in user_state and user_state[user_id].get('action') == 'set_trash_days':
-            trash_type = user_state[user_id]['trash_type']
-            days = user_state[user_id].get('days', '')
+        state = get_state(user_id)
+        if state and state.get('action') == 'set_trash_days':
+            trash_type = state['trash_type']
+            days = state.get('days', '')
             week_type = value if value in ['every', 'odd', 'even'] else 'every'
-            try:
-                name = MessagingApi(api_client).get_profile(user_id).display_name
-            except:
-                name = 'だれか'
-            conn = get_db()
-            cur = conn.cursor()
-            cur.execute('DELETE FROM trash_schedule WHERE trash_type=%s AND group_id=%s', (trash_type, user_group))
-            cur.execute('INSERT INTO trash_schedule (group_id, trash_type, weekdays, week_type) VALUES (%s, %s, %s, %s)', (user_group, trash_type, days, week_type))
-            conn.commit()
-            cur.close()
-            conn.close()
+            name = get_display_name(api_client, user_id)
+            with db() as conn:
+                cur = conn.cursor()
+                cur.execute('DELETE FROM trash_schedule WHERE trash_type=%s AND group_id=%s', (trash_type, user_group))
+                cur.execute(
+                    'INSERT INTO trash_schedule (group_id, trash_type, weekdays, week_type) VALUES (%s, %s, %s, %s)',
+                    (user_group, trash_type, days, week_type),
+                )
+                conn.commit()
+                cur.close()
             week_label = {'every': '毎週', 'odd': '第1・3週', 'even': '第2・4週'}.get(week_type, '毎週')
             if user_group:
                 push_to_group(user_group, f'⚙️ 設定が更新されました\n🗑️ {trash_type}: {days}曜日（{week_label}）\n（{name}が設定）')
-            user_state.pop(user_id, None)
+            clear_state(user_id)
             reply = TextMessage(text=f'以下の設定を保存しました☑️\n・{trash_type}: {days}曜日（{week_label}）\n前日21時と当日朝7時に通知します🗑️', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='➕ 続けて登録', data='action=ゴミ登録')),
             ]))
@@ -838,10 +954,13 @@ def process_action(action, value, context, user_id, api_client, reply_token):
     send_reply(api_client, reply_token, reply)
 
 
+# ============================================================
+# Event handlers
+# ============================================================
+
 @handler.add(PostbackEvent)
 def handle_postback(event):
-    data = event.postback.data
-    params = dict(item.split('=') for item in data.split('&'))
+    params = dict(parse_qsl(event.postback.data, keep_blank_values=True))
     action = params.get('action', '')
     value = params.get('value', '')
     context = params.get('context', '')
@@ -859,18 +978,14 @@ def handle_message(event):
         return
 
     with ApiClient(configuration) as api_client:
-        if user_id in user_state and user_state[user_id].get('action') == 'set_trash_type_custom':
+        state = get_state(user_id)
+        if state and state.get('action') == 'set_trash_type_custom':
             trash_type = text
-            user_state[user_id] = {'action': 'set_trash_days', 'trash_type': trash_type, 'days': ''}
-            reply = TextMessage(text=f'「{trash_type}」の収集曜日を選んでください。', quick_reply=QuickReply(items=[
-                QuickReplyItem(action=PostbackAction(label='月', data='action=ゴミ曜日&value=月')),
-                QuickReplyItem(action=PostbackAction(label='火', data='action=ゴミ曜日&value=火')),
-                QuickReplyItem(action=PostbackAction(label='水', data='action=ゴミ曜日&value=水')),
-                QuickReplyItem(action=PostbackAction(label='木', data='action=ゴミ曜日&value=木')),
-                QuickReplyItem(action=PostbackAction(label='金', data='action=ゴミ曜日&value=金')),
-                QuickReplyItem(action=PostbackAction(label='土', data='action=ゴミ曜日&value=土')),
-                QuickReplyItem(action=PostbackAction(label='日', data='action=ゴミ曜日&value=日')),
-            ]))
+            set_state(user_id, {'action': 'set_trash_days', 'trash_type': trash_type, 'days': ''})
+            reply = TextMessage(
+                text=f'「{trash_type}」の収集曜日を選んでください。',
+                quick_reply=QuickReply(items=WEEKDAY_ITEMS),
+            )
             send_reply(api_client, event.reply_token, reply)
 
         elif text in ['ごはん', 'お風呂', '出発・帰宅', 'ゴミの日']:
@@ -887,26 +1002,21 @@ def handle_message(event):
             )
             send_reply(api_client, event.reply_token, reply)
 
-        else:
-            if text.isdigit() and len(text) == 6:
-                conn = get_db()
+        elif text.isdigit() and len(text) == 6:
+            with db() as conn:
                 cur = conn.cursor()
                 cur.execute('SELECT group_id FROM groups WHERE invite_code = %s', (text,))
                 row = cur.fetchone()
                 if row:
                     group_id = row[0]
-                    try:
-                        profile = MessagingApi(api_client).get_profile(user_id)
-                        name = profile.display_name
-                    except:
-                        name = 'だれか'
+                    name = get_display_name(api_client, user_id)
                     cur.execute(
-                        'INSERT INTO members (user_id, display_name, group_id) VALUES (%s, %s, %s) ON CONFLICT (user_id, group_id) DO UPDATE SET display_name=%s',
-                        (user_id, name, group_id, name)
+                        '''INSERT INTO members (user_id, display_name, group_id) VALUES (%s, %s, %s)
+                           ON CONFLICT (user_id, group_id) DO UPDATE SET display_name=%s''',
+                        (user_id, name, group_id, name),
                     )
                     conn.commit()
                     cur.close()
-                    conn.close()
                     reply = TextMessage(text=(
                         '✅ 登録完了！グループと紐付けました😊\n\n'
                         '📖 さっそく使ってみましょう！\n'
@@ -918,11 +1028,11 @@ def handle_message(event):
                     ))
                 else:
                     cur.close()
-                    conn.close()
                     reply = TextMessage(text='コードが見つかりませんでした。グループに表示されたコードを確認してください。')
-                send_reply(api_client, event.reply_token, reply)
-            else:
-                send_reply(api_client, event.reply_token, TextMessage(text='メニューから選んでください。\nグループの登録コード（6桁）をお持ちの方はそのまま入力してください。'))
+            send_reply(api_client, event.reply_token, reply)
+
+        else:
+            send_reply(api_client, event.reply_token, TextMessage(text='メニューから選んでください。\nグループの登録コード（6桁）をお持ちの方はそのまま入力してください。'))
 
 
 @handler.add(FollowEvent)
@@ -930,12 +1040,8 @@ def handle_follow(event):
     user_id = event.source.user_id
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
-        try:
-            profile = line_bot_api.get_profile(user_id)
-            name = profile.display_name
-            print(f'Member followed: {name}')
-        except Exception as e:
-            print(f'Follow error: {e}')
+        name = get_display_name(api_client, user_id, default='(不明)')
+        logger.info(f'Member followed: {name} ({user_id})')
 
         line_bot_api.reply_message(
             ReplyMessageRequest(
@@ -961,18 +1067,18 @@ def handle_join(event):
     group_id = event.source.group_id
     invite_code = str(random.randint(100000, 999999))
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            'INSERT INTO groups (group_id, invite_code) VALUES (%s, %s) ON CONFLICT (group_id) DO UPDATE SET invite_code = %s',
-            (group_id, invite_code, invite_code)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-        print(f'Group registered: {group_id}, code: {invite_code}')
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                '''INSERT INTO groups (group_id, invite_code) VALUES (%s, %s)
+                   ON CONFLICT (group_id) DO UPDATE SET invite_code = %s''',
+                (group_id, invite_code, invite_code),
+            )
+            conn.commit()
+            cur.close()
+        logger.info(f'Group registered: {group_id}, code: {invite_code}')
     except Exception as e:
-        print(f'Group registration error: {e}')
+        logger.warning(f'Group registration error: {e}')
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
@@ -997,15 +1103,24 @@ def handle_join(event):
 def handle_leave(event):
     group_id = event.source.group_id
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('DELETE FROM groups WHERE group_id = %s', (group_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        print(f'Group removed: {group_id}')
+        with db() as conn:
+            cur = conn.cursor()
+            # daily_schedule は user_id ベース。グループに残ってる member 経由で当該行を削除。
+            cur.execute('''
+                DELETE FROM daily_schedule
+                WHERE user_id IN (SELECT user_id FROM members WHERE group_id = %s)
+            ''', (group_id,))
+            cur.execute('DELETE FROM members WHERE group_id = %s', (group_id,))
+            cur.execute('DELETE FROM trash_schedule WHERE group_id = %s', (group_id,))
+            cur.execute('DELETE FROM bath_schedule WHERE group_id = %s', (group_id,))
+            cur.execute('DELETE FROM bath_done WHERE group_id = %s', (group_id,))
+            cur.execute('DELETE FROM reminder_sent WHERE group_id = %s', (group_id,))
+            cur.execute('DELETE FROM groups WHERE group_id = %s', (group_id,))
+            conn.commit()
+            cur.close()
+        logger.info(f'Group removed (cascade): {group_id}')
     except Exception as e:
-        print(f'Group removal error: {e}')
+        logger.warning(f'Group removal error: {e}')
 
 
 with app.app_context():
