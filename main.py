@@ -381,12 +381,12 @@ def reminder_loop():
                         notify_dt = datetime.combine(now.date(), datetime.strptime('07:00', '%H:%M').time())
                         if abs((now - notify_dt).total_seconds()) < 90:
                             if mark_reminder(group_id, f'trash_today:{trash_type}', today_date):
-                                push_to_group(group_id, f'⏰ リマインド\n🗑️ 今日は{trash_type}の日です！忘れずに！')
+                                push_to_group(group_id, f'🗑️ 今日は{trash_type}の日です〜\n忘れずに〜🫘')
                     if yesterday in weekdays and _should_notify_week(week_type, yesterday_date):
                         notify_dt = datetime.combine(now.date(), datetime.strptime('21:00', '%H:%M').time())
                         if abs((now - notify_dt).total_seconds()) < 90:
                             if mark_reminder(group_id, f'trash_tomorrow:{trash_type}', yesterday_date):
-                                push_to_group(group_id, f'⏰ リマインド\n🗑️ 明日は{trash_type}の日です！準備を忘れずに！')
+                                push_to_group(group_id, f'🗑️ 明日は{trash_type}の日です〜\n準備よろしくおねがいします🫘')
 
                 for group_id, notify_time in bath_rows:
                     if not group_id:
@@ -399,7 +399,7 @@ def reminder_loop():
                         )
                         done = cur.fetchone()
                         if not done and mark_reminder(group_id, 'bath_unwashed', today_date):
-                            push_to_group(group_id, '⏰ リマインド\n🛁 まだお風呂が洗われていません！')
+                            push_to_group(group_id, '🛁 そろそろお風呂…まだ洗われてないみたい🫘')
                 cur.close()
         except Exception as e:
             logger.warning(f'Reminder loop error: {e}')
@@ -517,7 +517,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
     elif action == 'ごはんできた':
         name = get_display_name(api_client, user_id)
         if user_group:
-            push_to_group(user_group, f'🍚 {name}がご飯を作りました！みんな集まってください！')
+            push_to_group(user_group, f'🍚 {name}がごはん作ってくれたよ〜\nみんな集合〜！')
         reply = TextMessage(text='以下の内容を家族グループに送りました☑️\n・ごはんができました！')
 
     # ========== お風呂 ==========
@@ -1039,8 +1039,8 @@ def handle_follow(event):
             ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(text=
-                    'こんにちは！まめBotです🫘\n\n'
-                    '家族の日常をもっとスムーズにするお手伝いをします。\n\n'
+                    'はじめまして、まめBotです🫘\n\n'
+                    '家族のちょっとした連絡、ぼくがお手伝いします。\n\n'
                     '【プライバシーポリシー】\n'
                     '・収集情報: LINEユーザーID・表示名・入力内容\n'
                     '・利用目的: グループ内での情報共有機能の提供\n'
@@ -1078,8 +1078,9 @@ def handle_join(event):
             ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(text=
-                    'まめBotがグループに参加しました🫘\n\n'
-                    '家族の日常をもっとスムーズにするお手伝いをします。\n\n'
+                    'まめBotがグループに参加しました🫘\n'
+                    'よろしくおねがいします〜\n\n'
+                    '家族のちょっとした連絡、ぼくがお手伝いします。\n\n'
                     '【登録手順】\n'
                     '① 下のリンクからまめBotを友達追加👇\n'
                     'https://line.me/R/ti/p/@240fwfwn\n\n'
