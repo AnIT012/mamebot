@@ -599,7 +599,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             return
         minute = int(value)
         notify_time = f'{hour:02d}:{minute:02d}'
-        name = get_display_name(api_client, user_id)
         if user_group:
             with db() as conn:
                 cur = conn.cursor()
@@ -610,7 +609,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
                 )
                 conn.commit()
                 cur.close()
-            push_to_group(user_group, f'⚙️ 設定が更新されました\n🛁 お風呂未洗い通知時間: {notify_time}\n（{name}が設定）')
         clear_state(user_id)
         reply = TextMessage(text=f'以下の設定を保存しました☑️\n・お風呂未洗い通知: {notify_time}')
 
@@ -873,9 +871,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             cur.execute('DELETE FROM trash_schedule WHERE trash_type=%s AND group_id=%s', (value, user_group))
             conn.commit()
             cur.close()
-        name = get_display_name(api_client, user_id)
-        if user_group:
-            push_to_group(user_group, f'⚙️ 設定が更新されました\n🗑️ {value}のスケジュールを削除しました\n（{name}が操作）')
         reply = TextMessage(text=f'以下の設定を保存しました☑️\n・{value}のスケジュールを削除しました')
 
     elif action == 'ゴミ登録':
@@ -925,7 +920,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             trash_type = state['trash_type']
             days = state.get('days', '')
             week_type = value if value in ['every', 'odd', 'even'] else 'every'
-            name = get_display_name(api_client, user_id)
             with db() as conn:
                 cur = conn.cursor()
                 cur.execute('DELETE FROM trash_schedule WHERE trash_type=%s AND group_id=%s', (trash_type, user_group))
@@ -936,8 +930,6 @@ def process_action(action, value, context, user_id, api_client, reply_token):
                 conn.commit()
                 cur.close()
             week_label = {'every': '毎週', 'odd': '第1・3週', 'even': '第2・4週'}.get(week_type, '毎週')
-            if user_group:
-                push_to_group(user_group, f'⚙️ 設定が更新されました\n🗑️ {trash_type}: {days}曜日（{week_label}）\n（{name}が設定）')
             clear_state(user_id)
             reply = TextMessage(text=f'以下の設定を保存しました☑️\n・{trash_type}: {days}曜日（{week_label}）\n前日21時と当日朝7時に通知します🗑️', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='➕ 続けて登録', data='action=ゴミ登録')),
