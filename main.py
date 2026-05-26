@@ -156,15 +156,10 @@ def init_db():
         ''')
         conn.commit()
 
-        # 既存グループにもデフォルトのまとめ時刻を初期化（重複時は無視）
+        # 既存グループに「家族まとめ」のデフォルト時刻を初期化（重複時は無視）
         cur.execute('''
             INSERT INTO summary_schedule (group_id, summary_type, notify_time)
-            SELECT group_id, 'dinner', TIME '17:30' FROM groups
-            ON CONFLICT (group_id, summary_type) DO NOTHING
-        ''')
-        cur.execute('''
-            INSERT INTO summary_schedule (group_id, summary_type, notify_time)
-            SELECT group_id, 'homecoming', TIME '18:30' FROM groups
+            SELECT group_id, 'daily', TIME '16:00' FROM groups
             ON CONFLICT (group_id, summary_type) DO NOTHING
         ''')
         conn.commit()
@@ -321,37 +316,8 @@ def push_members(text, group_id):
         logger.warning(f'push_members failed: {e}')
 
 
-def send_dinner_summary(group_id):
-    today = get_jst_date()
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute('''
-            SELECT user_name, meal_status FROM daily_schedule
-            WHERE created_date = %s
-            AND user_id IN (SELECT user_id FROM members WHERE group_id = %s)
-            ORDER BY id
-        ''', (today, group_id))
-        responses = cur.fetchall()
-        cur.execute('''
-            SELECT display_name FROM members
-            WHERE group_id = %s
-            AND user_id NOT IN (
-                SELECT user_id FROM daily_schedule
-                WHERE created_date = %s AND meal_status IS NOT NULL
-            )
-        ''', (group_id, today))
-        unanswered = cur.fetchall()
-        cur.close()
-    summary = '🍚 夕食まとめ'
-    for r_name, r_meal in responses:
-        if r_meal:
-            summary += f'\n{r_name}: {r_meal}'
-    for (u_name,) in unanswered:
-        summary += f'\n{u_name}: 未回答'
-    push_to_group(group_id, summary)
-
-
-def send_homecoming_summary(group_id):
+def send_daily_summary(group_id):
+    """1日1回、家族全員の出発・帰宅・夕食予定をまとめて送る。"""
     today = get_jst_date()
     with db() as conn:
         cur = conn.cursor()
@@ -368,10 +334,10 @@ def send_homecoming_summary(group_id):
         ''', (group_id, today))
         unanswered = cur.fetchall()
         cur.close()
-    # 誰も入力していない日は通知しない（ノイズ防止）
+    # 家族メンバーがそもそも未登録なら何もしない
     if not answered and not unanswered:
         return
-    summary = '🚃 本日の帰宅・出発まとめ'
+    summary = f'🏠 今日の家族まとめ（{today.month}/{today.day}）'
     for r_name, r_depart, r_arrive, r_meal in answered:
         line_parts = [r_name]
         if r_depart:
@@ -379,7 +345,9 @@ def send_homecoming_summary(group_id):
         if r_arrive:
             line_parts.append(f'帰宅 {r_arrive}')
         if r_meal:
-            line_parts.append(r_meal)
+            line_parts.append(f'夕食 {r_meal}')
+        if len(line_parts) == 1:
+            line_parts.append('未回答')
         summary += f'\n{" / ".join(line_parts)}'
     for (u_name,) in unanswered:
         summary += f'\n{u_name}: 未回答'
@@ -475,18 +443,15 @@ def reminder_loop():
                         if not done and mark_reminder(group_id, 'bath_unwashed', today_date):
                             push_to_group(group_id, '🛁 そろそろお風呂…まだ洗われてないみたい🫘')
 
-                cur.execute('SELECT group_id, summary_type, notify_time FROM summary_schedule')
+                cur.execute("SELECT group_id, notify_time FROM summary_schedule WHERE summary_type = 'daily'")
                 summary_rows = cur.fetchall()
-                for group_id, summary_type, notify_time in summary_rows:
+                for group_id, notify_time in summary_rows:
                     if not group_id:
                         continue
                     notify_dt = datetime.combine(now.date(), notify_time)
                     if abs((now - notify_dt).total_seconds()) < 90:
-                        if mark_reminder(group_id, f'summary:{summary_type}', today_date):
-                            if summary_type == 'dinner':
-                                send_dinner_summary(group_id)
-                            elif summary_type == 'homecoming':
-                                send_homecoming_summary(group_id)
+                        if mark_reminder(group_id, 'summary:daily', today_date):
+                            send_daily_summary(group_id)
                 cur.close()
         except Exception as e:
             logger.warning(f'Reminder loop error: {e}')
@@ -572,11 +537,9 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         if not user_group:
             send_reply(api_client, reply_token, not_registered_reply())
             return
-        current_time = get_summary_time_label(user_group, 'dinner')
-        reply = TextMessage(text=f'何をしますか？\n\n夕食まとめ通知: {current_time}', quick_reply=QuickReply(items=[
+        reply = TextMessage(text='何をしますか？', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='🍽️ ご飯どうする？', data='action=ご飯どうする')),
             QuickReplyItem(action=PostbackAction(label='🔔 できました！', data='action=ごはんできた')),
-            QuickReplyItem(action=PostbackAction(label='⏰ まとめ時刻を変更', data='action=夕食まとめ時刻設定')),
         ]))
 
     elif action == 'ご飯どうする':
@@ -599,7 +562,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             )
             conn.commit()
             cur.close()
-        reply = TextMessage(text=f'☑️ 夕食の予定を登録しました\n・{value}\n\nまとめは設定時刻に家族グループへ送ります🫘')
+        reply = TextMessage(text=f'☑️ 夕食の予定を登録しました\n・{value}\n\n家族まとめは設定時刻に家族グループへ送ります🫘')
 
     elif action == 'ごはんできた':
         name = get_display_name(api_client, user_id)
@@ -678,28 +641,25 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         update_state(user_id, hour=int(value))
         reply = TextMessage(text='何分ですか？', quick_reply=make_minute_qr('bath'))
 
-    # ========== まとめ時刻設定（夕食/帰宅 共通）==========
-    elif action in ('夕食まとめ時刻設定', '帰宅まとめ時刻設定'):
-        summary_type = 'dinner' if action == '夕食まとめ時刻設定' else 'homecoming'
-        ctx = f'summary_{summary_type}'
-        set_state(user_id, {'action': 'set_summary_time', 'summary_type': summary_type})
+    # ========== 家族まとめ時刻設定 ==========
+    elif action == '家族まとめ時刻設定':
+        set_state(user_id, {'action': 'set_summary_time'})
         reply = TextMessage(text='時間帯を選んでください。', quick_reply=QuickReply(items=[
-            QuickReplyItem(action=PostbackAction(label='午前', data=f'action=まとめ時間帯&value=am&context={ctx}')),
-            QuickReplyItem(action=PostbackAction(label='午後', data=f'action=まとめ時間帯&value=pm&context={ctx}')),
+            QuickReplyItem(action=PostbackAction(label='午前', data='action=まとめ時間帯&value=am&context=summary_daily')),
+            QuickReplyItem(action=PostbackAction(label='午後', data='action=まとめ時間帯&value=pm&context=summary_daily')),
         ]))
 
-    elif action == 'まとめ時間帯' and context in ('summary_dinner', 'summary_homecoming'):
+    elif action == 'まとめ時間帯' and context == 'summary_daily':
         hours = AM_HOURS if value == 'am' else PM_HOURS
         reply = TextMessage(text='何時ですか？', quick_reply=make_hour_qr(hours, context))
 
-    elif action == '時' and context in ('summary_dinner', 'summary_homecoming'):
+    elif action == '時' and context == 'summary_daily':
         update_state(user_id, hour=int(value))
         reply = TextMessage(text='何分ですか？', quick_reply=make_minute_qr(context))
 
-    elif action == '分' and context in ('summary_dinner', 'summary_homecoming'):
+    elif action == '分' and context == 'summary_daily':
         state = get_state(user_id) or {}
         hour = state.get('hour')
-        summary_type = 'dinner' if context == 'summary_dinner' else 'homecoming'
         if hour is None:
             send_reply(api_client, reply_token, TextMessage(text='メニューから最初からやり直してください。'))
             return
@@ -710,15 +670,14 @@ def process_action(action, value, context, user_id, api_client, reply_token):
                 cur = conn.cursor()
                 cur.execute(
                     '''INSERT INTO summary_schedule (group_id, summary_type, notify_time)
-                       VALUES (%s, %s, %s)
+                       VALUES (%s, 'daily', %s)
                        ON CONFLICT (group_id, summary_type) DO UPDATE SET notify_time = EXCLUDED.notify_time''',
-                    (user_group, summary_type, notify_time),
+                    (user_group, notify_time),
                 )
                 conn.commit()
                 cur.close()
         clear_state(user_id)
-        type_label = '夕食' if summary_type == 'dinner' else '帰宅・出発'
-        reply = TextMessage(text=f'☑️ {type_label}まとめ通知時刻を {notify_time} に設定しました')
+        reply = TextMessage(text=f'☑️ 家族まとめ通知時刻を {notify_time} に設定しました')
 
     elif action == '分' and context == 'bath':
         state = get_state(user_id) or {}
@@ -747,11 +706,11 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         if not user_group:
             send_reply(api_client, reply_token, not_registered_reply())
             return
-        current_time = get_summary_time_label(user_group, 'homecoming')
-        reply = TextMessage(text=f'どうしますか？\n\n帰宅まとめ通知: {current_time}', quick_reply=QuickReply(items=[
+        current_time = get_summary_time_label(user_group, 'daily')
+        reply = TextMessage(text=f'どうしますか？\n\n家族まとめ通知: {current_time}', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='📤 時間を共有する', data='action=帰宅共有開始')),
             QuickReplyItem(action=PostbackAction(label='📋 今日の状況を確認', data='action=帰宅確認')),
-            QuickReplyItem(action=PostbackAction(label='⏰ まとめ時刻を変更', data='action=帰宅まとめ時刻設定')),
+            QuickReplyItem(action=PostbackAction(label='⏰ まとめ時刻を変更', data='action=家族まとめ時刻設定')),
         ]))
 
     elif action == '帰宅共有開始':
@@ -858,7 +817,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         if arrive:
             confirm_parts.append(f'・帰宅 {arrive}')
         confirm_parts.append(f'・ご飯 {value}')
-        reply = TextMessage(text='☑️ 登録しました\n' + '\n'.join(confirm_parts) + '\n\nまとめは設定時刻に家族グループへ送ります🫘')
+        reply = TextMessage(text='☑️ 登録しました\n' + '\n'.join(confirm_parts) + '\n\n家族まとめは設定時刻に家族グループへ送ります🫘')
 
     elif action == '帰宅確認':
         with db() as conn:
@@ -1083,11 +1042,12 @@ def handle_message(event):
         elif text == '使い方':
             reply = TextMessage(text=
                 '📖 まめBot 使い方\n\n'
-                '🍚 ごはん\n夕食の予定を個別チャットで登録すると、設定時刻にまとめて家族グループへ通知します（デフォルト 17:30）。「できました！」は即時通知。\n\n'
-                '🚃 出発・帰宅\n出発・帰宅時間とご飯の有無を登録すると、設定時刻にまとめて家族グループへ通知します（デフォルト 18:30）。「今日の状況を確認」で随時チェック・全員への入力依頼もできます。\n\n'
+                '🏠 家族まとめ通知\n夕食の予定・出発・帰宅時間を個別チャットで登録すると、設定時刻に1日1回だけまとめて家族グループへ通知します（デフォルト 16:00）。\n\n'
+                '🍚 ごはん\n夕食の予定を登録（家族まとめに反映）。「できました！」は即時通知。\n\n'
+                '🚃 出発・帰宅\n今日の出発・帰宅時間とご飯の有無を登録（家族まとめに反映）。「今日の状況を確認」で随時チェック・全員への入力依頼もできます。\n\n'
                 '🛁 お風呂\nお風呂を洗ったか家族に報告・お願いができます。設定した時間までに洗われていなければ自動通知します。\n\n'
                 '🗑️ ゴミの日\nゴミの種類と収集曜日を登録すると前日21時と当日朝7時に自動通知されます。第1・3週や第2・4週の設定も可能です。\n\n'
-                '⏰ まとめ通知時刻は各メニュー内の「⏰ まとめ時刻を変更」から設定できます🫘'
+                '⏰ 家族まとめ通知時刻は「出発・帰宅」メニュー内の「⏰ まとめ時刻を変更」から設定できます🫘'
             )
             send_reply(api_client, event.reply_token, reply)
 
@@ -1163,16 +1123,10 @@ def handle_join(event):
                    ON CONFLICT (group_id) DO UPDATE SET invite_code = %s''',
                 (group_id, invite_code, invite_code),
             )
-            # まとめ通知のデフォルト時刻をセット
+            # 家族まとめ通知のデフォルト時刻をセット
             cur.execute(
                 '''INSERT INTO summary_schedule (group_id, summary_type, notify_time)
-                   VALUES (%s, 'dinner', TIME '17:30')
-                   ON CONFLICT (group_id, summary_type) DO NOTHING''',
-                (group_id,),
-            )
-            cur.execute(
-                '''INSERT INTO summary_schedule (group_id, summary_type, notify_time)
-                   VALUES (%s, 'homecoming', TIME '18:30')
+                   VALUES (%s, 'daily', TIME '16:00')
                    ON CONFLICT (group_id, summary_type) DO NOTHING''',
                 (group_id,),
             )
