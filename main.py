@@ -465,6 +465,14 @@ def _should_notify_week(week_type, date_obj):
         return is_nth_week(date_obj, [1, 3])
     if week_type == 'even':
         return is_nth_week(date_obj, [2, 4])
+    if week_type == 'first':
+        return is_nth_week(date_obj, [1])
+    if week_type == 'second':
+        return is_nth_week(date_obj, [2])
+    if week_type == 'third':
+        return is_nth_week(date_obj, [3])
+    if week_type == 'fourth':
+        return is_nth_week(date_obj, [4])
     return False
 
 
@@ -887,11 +895,15 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             cur.close()
         if rows:
             def week_type_label(wt):
-                if wt == 'odd':
-                    return '（第1・3週）'
-                if wt == 'even':
-                    return '（第2・4週）'
-                return ''
+                labels = {
+                    'odd': '（第1・3週）',
+                    'even': '（第2・4週）',
+                    'first': '（第1週のみ）',
+                    'second': '（第2週のみ）',
+                    'third': '（第3週のみ）',
+                    'fourth': '（第4週のみ）',
+                }
+                return labels.get(wt, '')
             schedule_text = '\n'.join([f'・{t}: {w}曜日{week_type_label(wt)}' for t, w, wt in rows])
             reply = TextMessage(text=f'現在のゴミ出しスケジュール📅\n{schedule_text}\n\n前日21時と当日朝7時に通知します。', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='➕ 追加', data='action=ゴミ登録')),
@@ -968,6 +980,10 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             QuickReplyItem(action=PostbackAction(label='毎週', data='action=ゴミ曜日完了&value=every')),
             QuickReplyItem(action=PostbackAction(label='第1・3週', data='action=ゴミ曜日完了&value=odd')),
             QuickReplyItem(action=PostbackAction(label='第2・4週', data='action=ゴミ曜日完了&value=even')),
+            QuickReplyItem(action=PostbackAction(label='第1週のみ', data='action=ゴミ曜日完了&value=first')),
+            QuickReplyItem(action=PostbackAction(label='第2週のみ', data='action=ゴミ曜日完了&value=second')),
+            QuickReplyItem(action=PostbackAction(label='第3週のみ', data='action=ゴミ曜日完了&value=third')),
+            QuickReplyItem(action=PostbackAction(label='第4週のみ', data='action=ゴミ曜日完了&value=fourth')),
         ]))
 
     elif action == 'ゴミ曜日完了':
@@ -975,7 +991,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         if state and state.get('action') == 'set_trash_days':
             trash_type = state['trash_type']
             days = state.get('days', '')
-            week_type = value if value in ['every', 'odd', 'even'] else 'every'
+            week_type = value if value in ['every', 'odd', 'even', 'first', 'second', 'third', 'fourth'] else 'every'
             with db() as conn:
                 cur = conn.cursor()
                 cur.execute('DELETE FROM trash_schedule WHERE trash_type=%s AND group_id=%s', (trash_type, user_group))
@@ -985,7 +1001,15 @@ def process_action(action, value, context, user_id, api_client, reply_token):
                 )
                 conn.commit()
                 cur.close()
-            week_label = {'every': '毎週', 'odd': '第1・3週', 'even': '第2・4週'}.get(week_type, '毎週')
+            week_label = {
+                'every': '毎週',
+                'odd': '第1・3週',
+                'even': '第2・4週',
+                'first': '第1週のみ',
+                'second': '第2週のみ',
+                'third': '第3週のみ',
+                'fourth': '第4週のみ',
+            }.get(week_type, '毎週')
             clear_state(user_id)
             reply = TextMessage(text=f'以下の設定を保存しました☑️\n・{trash_type}: {days}曜日（{week_label}）\n前日21時と当日朝7時に通知します🗑️', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='➕ 続けて登録', data='action=ゴミ登録')),
