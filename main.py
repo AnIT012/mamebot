@@ -145,6 +145,23 @@ def init_db():
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS summary_schedule (
+                id SERIAL PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                summary_type TEXT NOT NULL,
+                notify_time TIME NOT NULL,
+                UNIQUE (group_id, summary_type)
+            )
+        ''')
+        conn.commit()
+
+        # 既存グループに「家族まとめ」のデフォルト時刻を初期化（重複時は無視）
+        cur.execute('''
+            INSERT INTO summary_schedule (group_id, summary_type, notify_time)
+            SELECT group_id, 'daily', TIME '16:00' FROM groups
+            ON CONFLICT (group_id, summary_type) DO NOTHING
+        ''')
         conn.commit()
 
         # Idempotent migrations — ADD COLUMN/DROP CONSTRAINT IF [NOT] EXISTS は安全に再実行可
@@ -299,31 +316,39 @@ def push_members(text, group_id):
         logger.warning(f'push_members failed: {e}')
 
 
-def send_dinner_summary(group_id):
+def send_daily_summary(group_id):
+    """1日1回、家族全員の出発・帰宅・夕食予定をまとめて送る。"""
     today = get_jst_date()
     with db() as conn:
         cur = conn.cursor()
         cur.execute('''
-            SELECT user_name, meal_status FROM daily_schedule
+            SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule
             WHERE created_date = %s
             AND user_id IN (SELECT user_id FROM members WHERE group_id = %s)
             ORDER BY id
         ''', (today, group_id))
-        responses = cur.fetchall()
+        answered = cur.fetchall()
         cur.execute('''
-            SELECT display_name FROM members
-            WHERE group_id = %s
-            AND user_id NOT IN (
-                SELECT user_id FROM daily_schedule
-                WHERE created_date = %s AND meal_status IS NOT NULL
-            )
+            SELECT display_name FROM members WHERE group_id = %s
+            AND user_id NOT IN (SELECT user_id FROM daily_schedule WHERE created_date = %s)
         ''', (group_id, today))
         unanswered = cur.fetchall()
         cur.close()
-    summary = '🍚 夕食まとめ'
-    for r_name, r_meal in responses:
+    # 家族メンバーがそもそも未登録なら何もしない
+    if not answered and not unanswered:
+        return
+    summary = f'🏠 今日の家族まとめ（{today.month}/{today.day}）'
+    for r_name, r_depart, r_arrive, r_meal in answered:
+        line_parts = [r_name]
+        if r_depart:
+            line_parts.append(f'出発 {r_depart}')
+        if r_arrive:
+            line_parts.append(f'帰宅 {r_arrive}')
         if r_meal:
-            summary += f'\n{r_name}: {r_meal}'
+            line_parts.append(f'夕食 {r_meal}')
+        if len(line_parts) == 1:
+            line_parts.append('未回答')
+        summary += f'\n{" / ".join(line_parts)}'
     for (u_name,) in unanswered:
         summary += f'\n{u_name}: 未回答'
     push_to_group(group_id, summary)
@@ -332,6 +357,23 @@ def send_dinner_summary(group_id):
 def is_nth_week(date_obj, nth_weeks):
     week_of_month = (date_obj.day - 1) // 7 + 1
     return week_of_month in nth_weeks
+
+
+def get_summary_time_label(group_id, summary_type):
+    """まとめ通知の現在時刻を 'HH:MM' or '未設定' で返す。"""
+    try:
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                'SELECT notify_time FROM summary_schedule WHERE group_id = %s AND summary_type = %s',
+                (group_id, summary_type),
+            )
+            row = cur.fetchone()
+            cur.close()
+        return row[0].strftime('%H:%M') if row else '未設定'
+    except Exception as e:
+        logger.warning(f'get_summary_time_label failed: {e}')
+        return '未設定'
 
 
 def mark_reminder(group_id, kind, target_date):
@@ -400,6 +442,16 @@ def reminder_loop():
                         done = cur.fetchone()
                         if not done and mark_reminder(group_id, 'bath_unwashed', today_date):
                             push_to_group(group_id, '🛁 そろそろお風呂…まだ洗われてないみたい🫘')
+
+                cur.execute("SELECT group_id, notify_time FROM summary_schedule WHERE summary_type = 'daily'")
+                summary_rows = cur.fetchall()
+                for group_id, notify_time in summary_rows:
+                    if not group_id:
+                        continue
+                    notify_dt = datetime.combine(now.date(), notify_time)
+                    if abs((now - notify_dt).total_seconds()) < 90:
+                        if mark_reminder(group_id, 'summary:daily', today_date):
+                            send_daily_summary(group_id)
                 cur.close()
         except Exception as e:
             logger.warning(f'Reminder loop error: {e}')
@@ -413,6 +465,14 @@ def _should_notify_week(week_type, date_obj):
         return is_nth_week(date_obj, [1, 3])
     if week_type == 'even':
         return is_nth_week(date_obj, [2, 4])
+    if week_type == 'first':
+        return is_nth_week(date_obj, [1])
+    if week_type == 'second':
+        return is_nth_week(date_obj, [2])
+    if week_type == 'third':
+        return is_nth_week(date_obj, [3])
+    if week_type == 'fourth':
+        return is_nth_week(date_obj, [4])
     return False
 
 
@@ -510,9 +570,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             )
             conn.commit()
             cur.close()
-        if user_group:
-            send_dinner_summary(user_group)
-        reply = TextMessage(text=f'以下の内容を家族グループに送りました☑️\n・夕食: {value}')
+        reply = TextMessage(text=f'☑️ 夕食の予定を登録しました\n・{value}\n\n家族まとめは設定時刻に家族グループへ送ります🫘')
 
     elif action == 'ごはんできた':
         name = get_display_name(api_client, user_id)
@@ -591,6 +649,44 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         update_state(user_id, hour=int(value))
         reply = TextMessage(text='何分ですか？', quick_reply=make_minute_qr('bath'))
 
+    # ========== 家族まとめ時刻設定 ==========
+    elif action == '家族まとめ時刻設定':
+        set_state(user_id, {'action': 'set_summary_time'})
+        reply = TextMessage(text='時間帯を選んでください。', quick_reply=QuickReply(items=[
+            QuickReplyItem(action=PostbackAction(label='午前', data='action=まとめ時間帯&value=am&context=summary_daily')),
+            QuickReplyItem(action=PostbackAction(label='午後', data='action=まとめ時間帯&value=pm&context=summary_daily')),
+        ]))
+
+    elif action == 'まとめ時間帯' and context == 'summary_daily':
+        hours = AM_HOURS if value == 'am' else PM_HOURS
+        reply = TextMessage(text='何時ですか？', quick_reply=make_hour_qr(hours, context))
+
+    elif action == '時' and context == 'summary_daily':
+        update_state(user_id, hour=int(value))
+        reply = TextMessage(text='何分ですか？', quick_reply=make_minute_qr(context))
+
+    elif action == '分' and context == 'summary_daily':
+        state = get_state(user_id) or {}
+        hour = state.get('hour')
+        if hour is None:
+            send_reply(api_client, reply_token, TextMessage(text='メニューから最初からやり直してください。'))
+            return
+        minute = int(value)
+        notify_time = f'{hour:02d}:{minute:02d}'
+        if user_group:
+            with db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    '''INSERT INTO summary_schedule (group_id, summary_type, notify_time)
+                       VALUES (%s, 'daily', %s)
+                       ON CONFLICT (group_id, summary_type) DO UPDATE SET notify_time = EXCLUDED.notify_time''',
+                    (user_group, notify_time),
+                )
+                conn.commit()
+                cur.close()
+        clear_state(user_id)
+        reply = TextMessage(text=f'☑️ 家族まとめ通知時刻を {notify_time} に設定しました')
+
     elif action == '分' and context == 'bath':
         state = get_state(user_id) or {}
         hour = state.get('hour')
@@ -618,9 +714,11 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         if not user_group:
             send_reply(api_client, reply_token, not_registered_reply())
             return
-        reply = TextMessage(text='どうしますか？', quick_reply=QuickReply(items=[
+        current_time = get_summary_time_label(user_group, 'daily')
+        reply = TextMessage(text=f'どうしますか？\n\n家族まとめ通知: {current_time}', quick_reply=QuickReply(items=[
             QuickReplyItem(action=PostbackAction(label='📤 時間を共有する', data='action=帰宅共有開始')),
             QuickReplyItem(action=PostbackAction(label='📋 今日の状況を確認', data='action=帰宅確認')),
+            QuickReplyItem(action=PostbackAction(label='⏰ まとめ時刻を変更', data='action=家族まとめ時刻設定')),
         ]))
 
     elif action == '帰宅共有開始':
@@ -718,42 +816,8 @@ def process_action(action, value, context, user_id, api_client, reply_token):
                    depart_time=EXCLUDED.depart_time, arrive_time=EXCLUDED.arrive_time, meal_status=EXCLUDED.meal_status''',
                 (user_id, name, depart, arrive, value, today),
             )
-            if user_group:
-                cur.execute('''
-                    SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule
-                    WHERE created_date = %s AND user_id IN (SELECT user_id FROM members WHERE group_id = %s)
-                    ORDER BY id
-                ''', (today, user_group))
-            else:
-                cur.execute(
-                    'SELECT user_name, depart_time, arrive_time, meal_status FROM daily_schedule WHERE created_date = %s ORDER BY id',
-                    (today,),
-                )
-            rows = cur.fetchall()
             conn.commit()
             cur.close()
-        if len(rows) == 1:
-            parts = [f'🚃 {name}']
-            if depart:
-                parts.append(f'出発 {depart}')
-            if arrive:
-                parts.append(f'帰宅 {arrive}')
-            parts.append(value)
-            if user_group:
-                push_to_group(user_group, ' / '.join(parts))
-        else:
-            summary = '🚃 本日の帰宅・出発まとめ'
-            for r_name, r_depart, r_arrive, r_meal in rows:
-                line_parts = [r_name]
-                if r_depart:
-                    line_parts.append(f'出発 {r_depart}')
-                if r_arrive:
-                    line_parts.append(f'帰宅 {r_arrive}')
-                if r_meal:
-                    line_parts.append(r_meal)
-                summary += f'\n{" / ".join(line_parts)}'
-            if user_group:
-                push_to_group(user_group, summary)
         clear_state(user_id)
         confirm_parts = []
         if depart:
@@ -761,7 +825,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         if arrive:
             confirm_parts.append(f'・帰宅 {arrive}')
         confirm_parts.append(f'・ご飯 {value}')
-        reply = TextMessage(text='以下の内容を家族グループに送りました☑️\n' + '\n'.join(confirm_parts))
+        reply = TextMessage(text='☑️ 登録しました\n' + '\n'.join(confirm_parts) + '\n\n家族まとめは設定時刻に家族グループへ送ります🫘')
 
     elif action == '帰宅確認':
         with db() as conn:
@@ -831,11 +895,15 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             cur.close()
         if rows:
             def week_type_label(wt):
-                if wt == 'odd':
-                    return '（第1・3週）'
-                if wt == 'even':
-                    return '（第2・4週）'
-                return ''
+                labels = {
+                    'odd': '（第1・3週）',
+                    'even': '（第2・4週）',
+                    'first': '（第1週のみ）',
+                    'second': '（第2週のみ）',
+                    'third': '（第3週のみ）',
+                    'fourth': '（第4週のみ）',
+                }
+                return labels.get(wt, '')
             schedule_text = '\n'.join([f'・{t}: {w}曜日{week_type_label(wt)}' for t, w, wt in rows])
             reply = TextMessage(text=f'現在のゴミ出しスケジュール📅\n{schedule_text}\n\n前日21時と当日朝7時に通知します。', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='➕ 追加', data='action=ゴミ登録')),
@@ -912,6 +980,10 @@ def process_action(action, value, context, user_id, api_client, reply_token):
             QuickReplyItem(action=PostbackAction(label='毎週', data='action=ゴミ曜日完了&value=every')),
             QuickReplyItem(action=PostbackAction(label='第1・3週', data='action=ゴミ曜日完了&value=odd')),
             QuickReplyItem(action=PostbackAction(label='第2・4週', data='action=ゴミ曜日完了&value=even')),
+            QuickReplyItem(action=PostbackAction(label='第1週のみ', data='action=ゴミ曜日完了&value=first')),
+            QuickReplyItem(action=PostbackAction(label='第2週のみ', data='action=ゴミ曜日完了&value=second')),
+            QuickReplyItem(action=PostbackAction(label='第3週のみ', data='action=ゴミ曜日完了&value=third')),
+            QuickReplyItem(action=PostbackAction(label='第4週のみ', data='action=ゴミ曜日完了&value=fourth')),
         ]))
 
     elif action == 'ゴミ曜日完了':
@@ -919,7 +991,7 @@ def process_action(action, value, context, user_id, api_client, reply_token):
         if state and state.get('action') == 'set_trash_days':
             trash_type = state['trash_type']
             days = state.get('days', '')
-            week_type = value if value in ['every', 'odd', 'even'] else 'every'
+            week_type = value if value in ['every', 'odd', 'even', 'first', 'second', 'third', 'fourth'] else 'every'
             with db() as conn:
                 cur = conn.cursor()
                 cur.execute('DELETE FROM trash_schedule WHERE trash_type=%s AND group_id=%s', (trash_type, user_group))
@@ -929,7 +1001,15 @@ def process_action(action, value, context, user_id, api_client, reply_token):
                 )
                 conn.commit()
                 cur.close()
-            week_label = {'every': '毎週', 'odd': '第1・3週', 'even': '第2・4週'}.get(week_type, '毎週')
+            week_label = {
+                'every': '毎週',
+                'odd': '第1・3週',
+                'even': '第2・4週',
+                'first': '第1週のみ',
+                'second': '第2週のみ',
+                'third': '第3週のみ',
+                'fourth': '第4週のみ',
+            }.get(week_type, '毎週')
             clear_state(user_id)
             reply = TextMessage(text=f'以下の設定を保存しました☑️\n・{trash_type}: {days}曜日（{week_label}）\n前日21時と当日朝7時に通知します🗑️', quick_reply=QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(label='➕ 続けて登録', data='action=ゴミ登録')),
@@ -986,11 +1066,12 @@ def handle_message(event):
         elif text == '使い方':
             reply = TextMessage(text=
                 '📖 まめBot 使い方\n\n'
-                '🍚 ごはん\n夕食の予定を家族に共有したり、ごはんができたら一斉通知もできます。\n\n'
-                '🚃 出発・帰宅\n今日の出発・帰宅時間とご飯の有無を家族に共有できます。今日の状況確認や全員への入力依頼もできます。\n\n'
+                '🏠 家族まとめ通知\n夕食の予定・出発・帰宅時間を個別チャットで登録すると、設定時刻に1日1回だけまとめて家族グループへ通知します（デフォルト 16:00）。\n\n'
+                '🍚 ごはん\n夕食の予定を登録（家族まとめに反映）。「できました！」は即時通知。\n\n'
+                '🚃 出発・帰宅\n今日の出発・帰宅時間とご飯の有無を登録（家族まとめに反映）。「今日の状況を確認」で随時チェック・全員への入力依頼もできます。\n\n'
                 '🛁 お風呂\nお風呂を洗ったか家族に報告・お願いができます。設定した時間までに洗われていなければ自動通知します。\n\n'
                 '🗑️ ゴミの日\nゴミの種類と収集曜日を登録すると前日21時と当日朝7時に自動通知されます。第1・3週や第2・4週の設定も可能です。\n\n'
-                '💡 設定した内容はすべて家族グループに通知されます。'
+                '⏰ 家族まとめ通知時刻は「出発・帰宅」メニュー内の「⏰ まとめ時刻を変更」から設定できます🫘'
             )
             send_reply(api_client, event.reply_token, reply)
 
@@ -1066,6 +1147,13 @@ def handle_join(event):
                    ON CONFLICT (group_id) DO UPDATE SET invite_code = %s''',
                 (group_id, invite_code, invite_code),
             )
+            # 家族まとめ通知のデフォルト時刻をセット
+            cur.execute(
+                '''INSERT INTO summary_schedule (group_id, summary_type, notify_time)
+                   VALUES (%s, 'daily', TIME '16:00')
+                   ON CONFLICT (group_id, summary_type) DO NOTHING''',
+                (group_id,),
+            )
             conn.commit()
             cur.close()
         logger.info(f'Group registered: {group_id}, code: {invite_code}')
@@ -1108,6 +1196,7 @@ def handle_leave(event):
             cur.execute('DELETE FROM bath_schedule WHERE group_id = %s', (group_id,))
             cur.execute('DELETE FROM bath_done WHERE group_id = %s', (group_id,))
             cur.execute('DELETE FROM reminder_sent WHERE group_id = %s', (group_id,))
+            cur.execute('DELETE FROM summary_schedule WHERE group_id = %s', (group_id,))
             cur.execute('DELETE FROM groups WHERE group_id = %s', (group_id,))
             conn.commit()
             cur.close()
