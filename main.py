@@ -411,9 +411,15 @@ def reminder_loop():
 
             with db() as conn:
                 cur = conn.cursor()
-                cur.execute('SELECT group_id, trash_type, weekdays, week_type FROM trash_schedule')
+                cur.execute('''
+                    SELECT group_id, trash_type, weekdays, week_type FROM trash_schedule
+                    WHERE group_id IN (SELECT group_id FROM groups)
+                ''')
                 trash_rows = cur.fetchall()
-                cur.execute('SELECT group_id, notify_time FROM bath_schedule')
+                cur.execute('''
+                    SELECT group_id, notify_time FROM bath_schedule
+                    WHERE group_id IN (SELECT group_id FROM groups)
+                ''')
                 bath_rows = cur.fetchall()
 
                 for group_id, trash_type, weekdays, week_type in trash_rows:
@@ -445,7 +451,11 @@ def reminder_loop():
                         if not done and mark_reminder(group_id, 'bath_unwashed', today_date):
                             push_to_group(group_id, '🛁 そろそろお風呂…まだ洗われてないみたい🫘')
 
-                cur.execute("SELECT group_id, notify_time FROM summary_schedule WHERE summary_type = 'daily'")
+                cur.execute('''
+                    SELECT group_id, notify_time FROM summary_schedule
+                    WHERE summary_type = 'daily'
+                    AND group_id IN (SELECT group_id FROM groups)
+                ''')
                 summary_rows = cur.fetchall()
                 for group_id, notify_time in summary_rows:
                     if not group_id:
