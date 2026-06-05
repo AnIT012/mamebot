@@ -406,8 +406,8 @@ def reminder_loop():
             now = datetime.now(JST).replace(tzinfo=None)
             today_date = get_jst_date()
             today = weekday_map[now.weekday()]
-            yesterday = weekday_map[(now.weekday() - 1) % 7]
-            yesterday_date = today_date - timedelta(days=1)
+            tomorrow = weekday_map[(now.weekday() + 1) % 7]
+            tomorrow_date = today_date + timedelta(days=1)
 
             with db() as conn:
                 cur = conn.cursor()
@@ -419,15 +419,17 @@ def reminder_loop():
                 for group_id, trash_type, weekdays, week_type in trash_rows:
                     if not group_id:
                         continue
+                    # 当日朝7時：今日が収集日のとき「今日は◯◯の日」を通知
                     if today in weekdays and _should_notify_week(week_type, today_date):
                         notify_dt = datetime.combine(now.date(), datetime.strptime('07:00', '%H:%M').time())
                         if abs((now - notify_dt).total_seconds()) < 90:
                             if mark_reminder(group_id, f'trash_today:{trash_type}', today_date):
                                 push_to_group(group_id, f'🗑️ 今日は{trash_type}の日です〜\n忘れずに〜🫘')
-                    if yesterday in weekdays and _should_notify_week(week_type, yesterday_date):
+                    # 前日21時：明日が収集日のとき「明日は◯◯の日」を通知
+                    if tomorrow in weekdays and _should_notify_week(week_type, tomorrow_date):
                         notify_dt = datetime.combine(now.date(), datetime.strptime('21:00', '%H:%M').time())
                         if abs((now - notify_dt).total_seconds()) < 90:
-                            if mark_reminder(group_id, f'trash_tomorrow:{trash_type}', yesterday_date):
+                            if mark_reminder(group_id, f'trash_tomorrow:{trash_type}', tomorrow_date):
                                 push_to_group(group_id, f'🗑️ 明日は{trash_type}の日です〜\n準備よろしくおねがいします🫘')
 
                 for group_id, notify_time in bath_rows:
