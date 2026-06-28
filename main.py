@@ -60,6 +60,20 @@ def health_check():
     return "OK", 200
 
 
+@app.before_request
+def _start_timer():
+    request.environ['_request_start'] = time.monotonic()
+
+
+@app.after_request
+def _log_elapsed(response):
+    start = request.environ.get('_request_start')
+    if start is not None and request.path == '/callback':
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.info(f'POST /callback handled in {elapsed_ms:.0f}ms (status={response.status_code})')
+    return response
+
+
 # ============================================================
 # DB
 # ============================================================
