@@ -1,0 +1,44 @@
+# まめBot — Mac mini で常駐させる構成
+#   docker compose up -d --build
+# LINE の Webhook は ngrok などでホストの ${MAMEBOT_PORT:-8081} に通す（/callback）
+
+services:
+  db:
+    image: postgres:18
+    container_name: mamebot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mamebot
+      POSTGRES_USER: mamebot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - mamebot-pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mamebot -d mamebot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # ホストに 5432 を出さない（TeaMy の postgres と取り合わないため）
+
+  bot:
+    build: .
+    container_name: mamebot
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      LINE_CHANNEL_ACCESS_TOKEN: ${LINE_CHANNEL_ACCESS_TOKEN}
+      LINE_CHANNEL_SECRET: ${LINE_CHANNEL_SECRET}
+      DATABASE_URL: postgresql://mamebot:${POSTGRES_PASSWORD}@db:5432/mamebot
+    ports:
+      # 8080 は TeaMy v2 の OAuth コールバックが使うので 8081 に逃がす
+      - "127.0.0.1:${MAMEBOT_PORT:-8081}:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  mamebot-pgdata:

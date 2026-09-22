@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+logs/
+*.log
+*.sql
+*.dump
+__pycache__/
+.venv/
+install-service.ps1
